@@ -67,5 +67,8 @@ tests/
 
 ## Status
 
-Phase 0 (scaffolding) complete: builds, `cargo test` runs zero tests, fmt/clippy
-clean, CLI flags work. See WORKLOG.md and the plan for the phase breakdown.
+Phase 1 complete: `model` (`Status`/`TaskId`/`Task`) and `store` (`open` +
+migration 1 + task CRUD + `children`/`subtree`/`ancestors` CTEs + cascade delete),
+covered by 4 unit + 10 integration tests. `main.rs` does not open the store yet —
+that lands with the Phase 4 event loop. See WORKLOG.md and the plan for the phase
+breakdown.
