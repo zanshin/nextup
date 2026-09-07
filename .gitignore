@@ -1,0 +1,4 @@
+/target
+
+# Machine-local Claude Code settings
+/.claude/settings.local.json
