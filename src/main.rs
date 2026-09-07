@@ -1,12 +1,21 @@
 //! Binary entry point: hand-rolled argument parsing, a panic hook that restores
-//! the terminal, an RAII terminal guard, and (from Phase 4) the event loop.
-//! Domain logic lives in the `nextup` library crate, not here.
+//! the terminal, an RAII terminal guard, and the blocking event loop. Domain
+//! logic lives in the `nextup` library crate, not here.
 
 use std::io;
 use std::path::PathBuf;
 
-use anyhow::Context;
+use anyhow::{Context, Result};
+use crossterm::event::{Event, KeyEventKind, read};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use directories::ProjectDirs;
+use nextup::app::App;
+use nextup::{event, store, ui};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 
 /// Resolved configuration for a run.
 struct Args {
@@ -31,13 +40,38 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Drive the application. The interactive event loop is wired up in Phase 4; for
-/// now this just installs the panic hook, arms the terminal guard, and exits.
-fn run(args: Args) -> anyhow::Result<()> {
+/// Open the database, take over the terminal, and run the event loop until the
+/// app asks to quit. The `TerminalGuard` restores the terminal on every exit
+/// path, including a panic.
+fn run(args: Args) -> Result<()> {
     install_panic_hook();
-    let _guard = TerminalGuard::new()?;
 
-    let _db_path = args.db_path;
+    let conn = store::open(&args.db_path)
+        .with_context(|| format!("opening database at {}", args.db_path.display()))?;
+
+    let _guard = TerminalGuard::new().context("taking over the terminal")?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+
+    let mut app = App::new(&conn)?;
+    event_loop(&mut terminal, &mut app, &conn)
+}
+
+/// Draw, block for one key, translate it, apply it. Repeat until `should_quit`.
+fn event_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    conn: &rusqlite::Connection,
+) -> Result<()> {
+    while !app.should_quit {
+        terminal.draw(|frame| ui::render(app, frame))?;
+
+        if let Event::Key(key) = read()?
+            && key.kind != KeyEventKind::Release
+            && let Some(action) = event::action_for(key, &app.screen)
+        {
+            app.update(action, conn)?;
+        }
+    }
 
     Ok(())
 }
@@ -118,22 +152,24 @@ fn install_panic_hook() {
     }));
 }
 
-/// RAII guard for terminal state. `new` arms it and `Drop` tears it down, so the
-/// terminal is always restored on the way out of `run`. Phase 4 fills in the
-/// actual raw-mode / alternate-screen calls; for now every method is a no-op.
+/// RAII guard for terminal state. `new` enables raw mode and switches to the
+/// alternate screen; `Drop` (and the panic hook) undo both, so the terminal is
+/// always restored on the way out of `run`.
 struct TerminalGuard;
 
 impl TerminalGuard {
     fn new() -> io::Result<Self> {
-        // Phase 4: enable raw mode and enter the alternate screen here.
+        enable_raw_mode()?;
+        execute!(io::stdout(), EnterAlternateScreen)?;
+
         Ok(Self)
     }
 
-    /// Shared teardown used by both `Drop` and the panic hook. Safe to call even
-    /// when the terminal was never armed.
+    /// Shared teardown used by both `Drop` and the panic hook. Ordering mirrors
+    /// `new` in reverse; safe to call even if `new` never ran.
     fn restore() -> io::Result<()> {
-        // Phase 4: disable raw mode and leave the alternate screen here.
-        Ok(())
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+        disable_raw_mode()
     }
 }
 

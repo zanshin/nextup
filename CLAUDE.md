@@ -67,15 +67,21 @@ tests/
 
 ## Status
 
-Phase 3 complete — all pure domain logic done, still no terminal code.
+Phase 4 complete — navigable read-only TUI over real data.
 
 - `model`: `Status`/`TaskId`/`Task`, `is_outstanding`/`is_completed`.
 - `store`: `open` + migrations 1 & 2, task CRUD, `children`/`subtree`/`ancestors`,
   cascade delete, `set_status` (+ `pub(crate) set_status_within`),
-  `outstanding_ordered`/`completed_ordered`/`task_row` (`TaskRow`), and the
-  planning-table repository fns. All SQL lives here.
-- `planning`: `candidates`, `commit_session`, `swap_pick`, `plan_for`, `PlanError`;
-  pure `rank_carried_over` / `next_auto_priority`.
+  `outstanding_ordered`/`completed_ordered`/`task_row` (`TaskRow`), planning-table
+  repository fns. All SQL lives here.
+- `planning`: `candidates`, `commit_session`, `swap_pick`, `plan_for`, `PlanError`.
+- `app`: `Screen`, `Action`, `App`, `Detail`; `App::update(action, &conn)` is the
+  sole state transition. No ratatui/crossterm types.
+- `event`: `action_for(KeyEvent, &Screen) -> Option<Action>` (context-sensitive).
+- `ui`: `render(&App, &mut Frame)` — Outstanding/Completed/Detail, `> ` selection
+  marker, help footer, empty states.
+- `main`: DB open → `TerminalGuard` (raw mode + alt screen, restored on Drop &
+  panic) → blocking event loop.
 
-Covered by 9 unit + 31 integration tests. `main.rs` still does not open the store
-— that lands with the Phase 4 event loop. See WORKLOG.md and the plan.
+Covered by 12 unit + 38 integration tests (incl. 7 `TestBackend` e2e). Writes
+(create/edit/status changes from the UI) arrive in Phase 5. See WORKLOG.md.

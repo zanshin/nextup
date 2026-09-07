@@ -118,3 +118,34 @@
   keeps history but leaves active views; `plan_for`.
 - No terminal code. Verified: `cargo fmt --check`, `cargo clippy
   --all-targets -- -D warnings`, `cargo test` (9 unit + 31 integration) clean.
+
+## 2026-09-07 — Phase 4: TUI shell (read-only)
+
+- `app.rs` (no ratatui/crossterm types): `Screen` (`Outstanding` / `Completed`
+  / `Detail(TaskId)`), `Action` enum, `App` with per-screen data + selection,
+  `Detail { task, ancestors, subtree, selected }`. `App::update(action, &conn)`
+  is the single state-transition entry point; it reloads the target screen's
+  data from the store on every navigation so views never drift. `Back` from
+  Outstanding quits; from a sub-screen returns to Outstanding.
+- `event.rs`: `action_for(KeyEvent, &Screen) -> Option<Action>`. Ctrl-C quits;
+  global `q`/Esc/arrows+`jkgG`/`o`/`c`; `Enter`/`l` opens; `p` jumps to parent
+  (Detail only). 3 unit tests (Ctrl-C vs plain `c`, context sensitivity).
+- `ui.rs`: `render(&App, &mut Frame)` — header line, body, dim help footer.
+  Outstanding/Completed as `Table`s (pri/status/task+breadcrumb/date);
+  Detail = info block (breadcrumb `in: …`, title `[status] priority`, notes)
+  over an indented subtree `Table`. Selected row gets a literal `> ` marker
+  (`HighlightSpacing::Always`) so snapshots can assert on it. Empty-state text
+  for both lists and for a childless Detail.
+- `main.rs`: `store::open` first (DB created + migrated before touching the
+  terminal), then `TerminalGuard` (real `enable_raw_mode` + alternate screen,
+  restored on Drop and by the panic hook), `Terminal<CrosstermBackend>`, and a
+  blocking `read()` event loop filtering key-release events.
+- `tests/tui.rs` (7 e2e): a `Tui` harness feeding `KeyCode`s through
+  `event::action_for` -> `app::update` -> `ui::render` on a `TestBackend`,
+  asserting on trimmed buffer text. Covers daily-order + breadcrumb rendering,
+  selection-marker navigation, Detail (breadcrumb/notes/subtree) + jump to
+  parent, childless Detail, Completed list + `q` quit, Esc back-out chain,
+  empty-database states.
+- Verified: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (12 unit + 38 integration = 50) all clean. Binary confirmed to
+  create/migrate the DB before terminal setup.
