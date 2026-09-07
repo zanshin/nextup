@@ -52,7 +52,7 @@ fn run(args: Args) -> Result<()> {
     let _guard = TerminalGuard::new().context("taking over the terminal")?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
-    let mut app = App::new(&conn)?;
+    let mut app = App::new(&conn, chrono::Local::now().date_naive())?;
     event_loop(&mut terminal, &mut app, &mut conn)
 }
 

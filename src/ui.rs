@@ -13,7 +13,7 @@ use ratatui::widgets::{
     Block, Borders, Clear, HighlightSpacing, Paragraph, Row, Table, TableState, Wrap,
 };
 
-use crate::app::{App, Detail, Editor, Overlay, Screen, StatusPicker};
+use crate::app::{App, Confirm, Detail, Editor, Overlay, Screen, StatusPicker, TaskPicker};
 use crate::model::Status;
 use crate::store::TaskRow;
 
@@ -36,6 +36,8 @@ pub fn render(app: &App, frame: &mut Frame) {
         Screen::Outstanding => render_outstanding(app, frame, body),
         Screen::Completed => render_completed(app, frame, body),
         Screen::Detail(_) => render_detail(app, frame, body),
+        Screen::Planning => render_planning(app, frame, body),
+        Screen::Today => render_today(app, frame, body),
     }
 
     frame.render_widget(footer_widget(app), footer);
@@ -43,18 +45,20 @@ pub fn render(app: &App, frame: &mut Frame) {
     match &app.overlay {
         Some(Overlay::Editor(editor)) => render_editor(editor, frame, full),
         Some(Overlay::StatusPicker(picker)) => render_status_picker(picker, frame, full),
+        Some(Overlay::TaskPicker(picker)) => render_task_picker(picker, frame, full),
+        Some(Overlay::Confirm(confirm)) => render_confirm(confirm, frame, full),
         None => {}
     }
 }
 
 fn header_text(app: &App) -> String {
-    let title = match app.screen {
-        Screen::Outstanding => "Outstanding",
-        Screen::Completed => "Completed",
-        Screen::Detail(_) => "Detail",
-    };
-
-    format!("nextup — {title}")
+    match app.screen {
+        Screen::Outstanding => "nextup — Outstanding".to_string(),
+        Screen::Completed => "nextup — Completed".to_string(),
+        Screen::Detail(_) => "nextup — Detail".to_string(),
+        Screen::Planning => format!("nextup — Planning ({})", app.today),
+        Screen::Today => format!("nextup — Today ({})", app.today),
+    }
 }
 
 fn footer_widget(app: &App) -> Paragraph<'_> {
@@ -62,17 +66,20 @@ fn footer_widget(app: &App) -> Paragraph<'_> {
         return Paragraph::new(message.as_str()).style(Style::new().add_modifier(Modifier::BOLD));
     }
 
-    let help = if app.overlay.is_some() {
-        "enter confirm · esc cancel"
-    } else {
-        match app.screen {
+    let help = match &app.overlay {
+        Some(Overlay::Confirm(_)) => "y confirm · n cancel",
+        Some(Overlay::Editor(_)) => "enter save · esc cancel",
+        Some(_) => "j/k move · enter confirm · esc cancel",
+        None => match app.screen {
             Screen::Outstanding | Screen::Completed => {
-                "j/k move · enter detail · n new · a subtask · e/E title/notes · r priority · space status · o/c switch · q quit"
+                "j/k move · enter detail · n new · a subtask · e/E title/notes · r priority · space status · s plan · t today · q quit"
             }
             Screen::Detail(_) => {
                 "j/k move · enter open · p parent · tab fold · n/a new/subtask · e/E title/notes · r priority · space status · esc back"
             }
-        }
+            Screen::Planning => "j/k move · 1/2/3 assign · x clear · enter commit · esc cancel",
+            Screen::Today => "j/k move · space status · w swap slot · s re-plan · esc back",
+        },
     };
 
     Paragraph::new(help).style(Style::new().add_modifier(Modifier::DIM))
@@ -207,6 +214,157 @@ fn info_lines(detail: &Detail) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+fn render_planning(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(state) = &app.planning else {
+        return;
+    };
+
+    let [summary, list] = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).areas(area);
+
+    let slots = (1..=3u8)
+        .map(|slot| {
+            let title = state.picks[(slot - 1) as usize]
+                .and_then(|id| {
+                    state
+                        .candidates
+                        .iter()
+                        .find(|candidate| candidate.row.task.id == id)
+                })
+                .map_or("—", |candidate| candidate.row.task.title.as_str());
+            format!("{slot}: {title}")
+        })
+        .collect::<Vec<_>>()
+        .join("     ");
+
+    frame.render_widget(
+        Paragraph::new(slots).block(Block::new().borders(Borders::BOTTOM)),
+        summary,
+    );
+
+    if state.candidates.is_empty() {
+        frame.render_widget(Paragraph::new("No outstanding tasks to plan."), list);
+        return;
+    }
+
+    let rows = state.candidates.iter().map(|candidate| {
+        let slot = state
+            .slot_of(candidate.row.task.id)
+            .map_or_else(|| "[ ]".to_string(), |n| format!("[{n}]"));
+        let was = candidate
+            .prior_priority
+            .map_or_else(String::new, |p| format!("#{p}"));
+
+        Row::new([
+            slot,
+            candidate.row.task.status.to_string(),
+            title_cell(&candidate.row),
+            was,
+        ])
+    });
+
+    render_list(
+        frame,
+        list,
+        Table::new(
+            rows,
+            [
+                Constraint::Length(4),
+                Constraint::Length(12),
+                Constraint::Min(20),
+                Constraint::Length(5),
+            ],
+        )
+        .header(Row::new(["", "status", "task", "was"])),
+        state.selected,
+    );
+}
+
+fn render_today(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(state) = &app.todays_plan else {
+        return;
+    };
+
+    let Some(plan) = &state.plan else {
+        frame.render_widget(
+            Paragraph::new("No plan for today yet — press s to plan."),
+            area,
+        );
+        return;
+    };
+
+    if plan.items.is_empty() {
+        frame.render_widget(Paragraph::new("Today's plan is empty."), area);
+        return;
+    }
+
+    let rows = plan.items.iter().map(|item| {
+        let carried = if item.carried_over { "carried" } else { "" };
+        Row::new([
+            item.priority.to_string(),
+            item.row.task.status.to_string(),
+            title_cell(&item.row),
+            carried.to_string(),
+        ])
+    });
+
+    render_list(
+        frame,
+        area,
+        Table::new(
+            rows,
+            [
+                Constraint::Length(3),
+                Constraint::Length(12),
+                Constraint::Min(20),
+                Constraint::Length(8),
+            ],
+        )
+        .header(Row::new(["#", "status", "task", ""])),
+        state.selected,
+    );
+}
+
+fn render_task_picker(picker: &TaskPicker, frame: &mut Frame, area: Rect) {
+    let height = (picker.candidates.len().min(12) + 2).max(4) as u16;
+    let popup = centered_rect(52, height, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::bordered().title(format!(" {} ", picker.prompt));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = picker
+        .candidates
+        .iter()
+        .map(|row| Row::new([title_cell(row), row.task.status.to_string()]));
+
+    render_list(
+        frame,
+        inner,
+        Table::new(rows, [Constraint::Min(20), Constraint::Length(12)]),
+        picker.selected,
+    );
+}
+
+fn render_confirm(confirm: &Confirm, frame: &mut Frame, area: Rect) {
+    let popup = centered_rect(58, 5, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::bordered().title(" Confirm ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(confirm.prompt.clone()),
+            Line::from(""),
+            Line::from("y / n").style(Style::new().add_modifier(Modifier::DIM)),
+        ])
+        .wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 /// Render a `Table` with a leading selection-marker column so the highlighted

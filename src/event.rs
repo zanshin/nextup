@@ -12,6 +12,7 @@ pub fn action_for(key: KeyEvent, screen: &Screen, mode: Mode) -> Option<Action> 
     match mode {
         Mode::Editing => editing_action(key),
         Mode::Picking => picking_action(key),
+        Mode::Confirming => confirming_action(key),
         Mode::Normal => normal_action(key, screen),
     }
 }
@@ -32,6 +33,8 @@ fn normal_action(key: KeyEvent, screen: &Screen) -> Option<Action> {
             KeyCode::Tab | KeyCode::Char('z') => Some(Action::ToggleFold),
             other => list_action(other),
         },
+        Screen::Planning => planning_action(key.code),
+        Screen::Today => today_action(key.code),
     }
 }
 
@@ -46,6 +49,39 @@ fn global_action(code: KeyCode) -> Option<Action> {
         KeyCode::End | KeyCode::Char('G') => Some(Action::SelectLast),
         KeyCode::Char('o') => Some(Action::ShowOutstanding),
         KeyCode::Char('c') => Some(Action::ShowCompleted),
+        KeyCode::Char('s') => Some(Action::StartPlanning),
+        KeyCode::Char('t') => Some(Action::ShowToday),
+        _ => None,
+    }
+}
+
+/// Planning screen: assign the cursor task to a slot, clear it, or commit.
+fn planning_action(code: KeyCode) -> Option<Action> {
+    match code {
+        KeyCode::Enter => Some(Action::Confirm),
+        KeyCode::Char('1') => Some(Action::AssignSlot(1)),
+        KeyCode::Char('2') => Some(Action::AssignSlot(2)),
+        KeyCode::Char('3') => Some(Action::AssignSlot(3)),
+        KeyCode::Char('0') | KeyCode::Char('x') | KeyCode::Backspace => {
+            Some(Action::ClearAssignment)
+        }
+        _ => None,
+    }
+}
+
+/// Today screen: quick status change or swap a top-3 pick.
+fn today_action(code: KeyCode) -> Option<Action> {
+    match code {
+        KeyCode::Char(' ') => Some(Action::ChangeStatus),
+        KeyCode::Char('w') => Some(Action::SwapSlot),
+        _ => None,
+    }
+}
+
+fn confirming_action(key: KeyEvent) -> Option<Action> {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Enter => Some(Action::Confirm),
+        KeyCode::Char('n') | KeyCode::Esc => Some(Action::Cancel),
         _ => None,
     }
 }
@@ -156,6 +192,58 @@ mod tests {
         assert_eq!(
             action_for(key(KeyCode::Char('p')), &Screen::Outstanding, Mode::Normal),
             None,
+        );
+    }
+
+    #[test]
+    fn s_and_t_open_planning_and_today_from_any_normal_screen() {
+        assert_eq!(
+            action_for(key(KeyCode::Char('s')), &Screen::Outstanding, Mode::Normal),
+            Some(Action::StartPlanning),
+        );
+        assert_eq!(
+            action_for(key(KeyCode::Char('t')), &Screen::Completed, Mode::Normal),
+            Some(Action::ShowToday),
+        );
+    }
+
+    #[test]
+    fn number_keys_assign_slots_on_the_planning_screen() {
+        assert_eq!(
+            action_for(key(KeyCode::Char('2')), &Screen::Planning, Mode::Normal),
+            Some(Action::AssignSlot(2)),
+        );
+        assert_eq!(
+            action_for(key(KeyCode::Char('x')), &Screen::Planning, Mode::Normal),
+            Some(Action::ClearAssignment),
+        );
+        assert_eq!(
+            action_for(key(KeyCode::Enter), &Screen::Planning, Mode::Normal),
+            Some(Action::Confirm),
+        );
+    }
+
+    #[test]
+    fn w_swaps_on_the_today_screen_only() {
+        assert_eq!(
+            action_for(key(KeyCode::Char('w')), &Screen::Today, Mode::Normal),
+            Some(Action::SwapSlot),
+        );
+        assert_eq!(
+            action_for(key(KeyCode::Char('w')), &Screen::Outstanding, Mode::Normal),
+            None,
+        );
+    }
+
+    #[test]
+    fn confirming_mode_takes_y_and_n() {
+        assert_eq!(
+            action_for(key(KeyCode::Char('y')), &Screen::Planning, Mode::Confirming),
+            Some(Action::Confirm),
+        );
+        assert_eq!(
+            action_for(key(KeyCode::Char('n')), &Screen::Planning, Mode::Confirming),
+            Some(Action::Cancel),
         );
     }
 }

@@ -3,14 +3,21 @@
 //! -> `app::update` -> `ui::render` onto a `TestBackend` — and asserts on the
 //! rendered text.
 
+use chrono::NaiveDate;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nextup::app::{App, Screen};
 use nextup::model::{Status, Task, TaskId};
-use nextup::{event, store, ui};
+use nextup::{event, planning, store, ui};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use rusqlite::Connection;
 use tempfile::TempDir;
+
+/// The local date the harness treats as "today". Fixed so planning tests are
+/// deterministic; earlier dates are used for prior sessions.
+fn today() -> NaiveDate {
+    NaiveDate::from_ymd_opt(2026, 9, 8).unwrap()
+}
 
 /// A driven app plus its terminal and backing database.
 struct Tui {
@@ -26,7 +33,7 @@ impl Tui {
         let mut conn = store::open(&dir.path().join("nextup.db")).expect("open + migrate");
         seed(&mut conn);
 
-        let app = App::new(&conn).expect("build app");
+        let app = App::new(&conn, today()).expect("build app");
         let terminal = Terminal::new(TestBackend::new(120, 32)).expect("test terminal");
 
         Self {
@@ -135,6 +142,22 @@ fn task_by_title(conn: &Connection, title: &str) -> Task {
         .unwrap_or_else(|_| panic!("no task titled {title:?}"));
 
     store::get(conn, TaskId(id)).unwrap().unwrap()
+}
+
+/// The first whitespace-delimited token of a row, past the `> ` / `  ` marker.
+fn row_first_field(row: &str) -> &str {
+    row.trim_start_matches(['>', ' '])
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+}
+
+/// The data row whose title cell contains `needle`.
+fn row_with<'a>(screen: &'a str, needle: &str) -> &'a str {
+    data_rows(screen)
+        .into_iter()
+        .find(|row| row.contains(needle))
+        .unwrap_or_else(|| panic!("no row containing {needle:?} in:\n{screen}"))
 }
 
 #[test]
@@ -434,4 +457,141 @@ fn ctrl_c_quits_even_with_an_editor_open() {
     assert!(tui.app.overlay.is_none());
     assert!(!tui.screen().contains("half typed"));
     assert!(!tui.app.should_quit);
+}
+
+// --- Phase 6: daily planning flow --------------------------------------------
+
+/// Five root tasks; a prior session (three days before "today") ranked the first
+/// three 1/2/3.
+fn seed_prior_session(conn: &mut Connection) {
+    let a = store::create_task(conn, "Alpha", "").unwrap();
+    let b = store::create_task(conn, "Bravo", "").unwrap();
+    let c = store::create_task(conn, "Charlie", "").unwrap();
+    store::create_task(conn, "Delta", "").unwrap();
+    store::create_task(conn, "Echo", "").unwrap();
+
+    let prior = NaiveDate::from_ymd_opt(2026, 9, 5).unwrap();
+    planning::commit_session(conn, prior, [Some(a), Some(b), Some(c)]).unwrap();
+}
+
+#[test]
+fn planning_picks_carry_over_and_swap() {
+    let mut tui = Tui::new(seed_prior_session);
+
+    // enter planning
+    tui.press(KeyCode::Char('s'));
+    let screen = tui.screen();
+    assert!(screen.contains("nextup — Planning (2026-09-08)"));
+    // prior priorities are shown against the eligible tasks
+    assert!(row_with(&screen, "Alpha").contains("#1"));
+    assert!(row_with(&screen, "Bravo").contains("#2"));
+
+    // pick Delta -> 1, Echo -> 2, Alpha -> 3
+    tui.press(KeyCode::Char('j'))
+        .press(KeyCode::Char('j'))
+        .press(KeyCode::Char('j'));
+    assert!(selected_row(&tui.screen()).contains("Delta"));
+    tui.press(KeyCode::Char('1'));
+    tui.press(KeyCode::Char('j'));
+    assert!(selected_row(&tui.screen()).contains("Echo"));
+    tui.press(KeyCode::Char('2'));
+    tui.press(KeyCode::Char('g')); // back to Alpha
+    tui.press(KeyCode::Char('3'));
+
+    let screen = tui.screen();
+    assert!(row_with(&screen, "Delta").contains("[1]"));
+    assert!(row_with(&screen, "Echo").contains("[2]"));
+    assert!(row_with(&screen, "Alpha").contains("[3]"));
+
+    // commit — no plan existed for today, so no confirmation
+    tui.press(KeyCode::Enter);
+    assert!(matches!(tui.app.screen, Screen::Today));
+
+    let screen = tui.screen();
+    assert!(screen.contains("nextup — Today (2026-09-08)"));
+    let rows = data_rows(&screen);
+    assert_eq!(row_first_field(rows[0]), "1");
+    assert!(rows[0].contains("Delta"));
+    assert!(rows[1].contains("Echo"));
+    assert!(rows[2].contains("Alpha"));
+    // Bravo and Charlie carry over at 4 / 5 by their prior priority
+    assert!(rows[3].contains("Bravo") && rows[3].contains("carried"));
+    assert_eq!(row_first_field(rows[3]), "4");
+    assert!(rows[4].contains("Charlie") && rows[4].contains("carried"));
+    assert_eq!(row_first_field(rows[4]), "5");
+
+    // swap slot 2 (Echo) — pick the first eligible candidate (Bravo)
+    tui.press(KeyCode::Char('g')).press(KeyCode::Char('j'));
+    assert!(selected_row(&tui.screen()).contains("Echo"));
+    tui.press(KeyCode::Char('w'));
+    assert!(tui.screen().contains("Swap into slot 2"));
+    tui.press(KeyCode::Enter);
+
+    // Bravo now sits in slot 2; Echo is benched on_hold at 4+
+    let screen = tui.screen();
+    assert_eq!(row_first_field(row_with(&screen, "Bravo")), "2");
+    let echo_row = row_with(&screen, "Echo");
+    assert!(echo_row.contains("on_hold"));
+    assert!(echo_row.contains("carried"));
+
+    let echo = task_by_title(&tui.conn, "Echo");
+    assert_eq!(echo.status, Status::OnHold);
+    assert!(echo.priority.unwrap() >= 4);
+}
+
+#[test]
+fn re_planning_today_confirms_before_overwriting() {
+    let mut tui = Tui::new(|conn| {
+        let a = store::create_task(conn, "Apple", "").unwrap();
+        store::create_task(conn, "Banana", "").unwrap();
+        planning::commit_session(conn, today(), [Some(a), None, None]).unwrap();
+    });
+
+    tui.press(KeyCode::Char('s'));
+    // the existing pick pre-fills slot 1
+    assert!(row_with(&tui.screen(), "Apple").contains("[1]"));
+
+    // add Banana to slot 2 and try to commit -> confirmation
+    tui.press(KeyCode::Char('j')).press(KeyCode::Char('2'));
+    tui.press(KeyCode::Enter);
+    assert!(tui.screen().contains("Re-plan today"));
+
+    // decline: stay on Planning, plan unchanged
+    tui.press(KeyCode::Char('n'));
+    assert!(!tui.screen().contains("Re-plan today"));
+    assert!(matches!(tui.app.screen, Screen::Planning));
+
+    // accept
+    tui.press(KeyCode::Enter);
+    tui.press(KeyCode::Char('y'));
+    assert!(matches!(tui.app.screen, Screen::Today));
+
+    let screen = tui.screen();
+    assert_eq!(row_first_field(row_with(&screen, "Apple")), "1");
+    assert_eq!(row_first_field(row_with(&screen, "Banana")), "2");
+}
+
+#[test]
+fn today_screen_shows_an_empty_state_and_supports_quick_status_changes() {
+    let mut tui = Tui::new(|conn| {
+        let a = store::create_task(conn, "Task one", "").unwrap();
+        planning::commit_session(conn, today(), [Some(a), None, None]).unwrap();
+    });
+
+    // no plan yet -> t shows the placeholder before any planning
+    let mut empty = Tui::new(|_conn| {});
+    empty.press(KeyCode::Char('t'));
+    assert!(empty.screen().contains("No plan for today"));
+
+    // with a plan: quick status change from Today
+    tui.press(KeyCode::Char('t'));
+    assert!(selected_row(&tui.screen()).contains("Task one"));
+    tui.press(KeyCode::Char(' ')); // status picker
+    for _ in 0..5 {
+        tui.press(KeyCode::Char('j')); // new -> done
+    }
+    tui.press(KeyCode::Enter);
+
+    assert!(row_with(&tui.screen(), "Task one").contains("done"));
+    assert_eq!(task_by_title(&tui.conn, "Task one").status, Status::Done);
 }

@@ -189,3 +189,38 @@
   edit, and Ctrl-C from an open editor.
 - Verified: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test` (17 unit + 45 integration = 62) all clean.
+
+## 2026-09-07 — Phase 6: TUI daily planning flow
+
+- `App::new(conn, today: NaiveDate)` — the local date planning treats as "today"
+  is injected (main passes `Local::now().date_naive()`; tests fix it).
+- New `Screen::Planning` / `Screen::Today`; transient state in
+  `App.planning: Option<PlanningState>` / `App.todays_plan: Option<TodayState>`.
+- New `Mode::Confirming` and overlays `Overlay::TaskPicker` (pick one task, with
+  a `TaskPickPurpose`) and `Overlay::Confirm` (`prompt` + `PendingAction`).
+- `event.rs`: `s` → StartPlanning, `t` → ShowToday (both global). Planning keys
+  `1/2/3` assign, `0/x/Backspace` clear, `Enter` commit. Today keys `space`
+  status, `w` swap. Confirming mode: `y`/Enter confirm, `n`/Esc cancel.
+- `app.rs`:
+  - `start_planning` loads `planning::candidates`, pre-fills slots 1/2/3 from any
+    existing plan, records `has_existing_plan`.
+  - `assign_slot` (toggle off on repeat, move between slots), `clear_assignment`.
+  - `confirm_planning` → overwrite `Confirm` overlay if a plan exists, else
+    `commit_plan` → `planning::commit_session` → land on Today. Domain errors go
+    to `status_message` instead of bubbling.
+  - `show_today` loads `planning::plan_for`; `reload` refreshes it on the Today
+    screen.
+  - `begin_swap` builds the candidate list (outstanding minus current top 3),
+    opens the `TaskPicker`; confirm runs `planning::swap_pick` then reloads.
+  - `action_target` extended for Planning (selected candidate) and Today
+    (selected plan item) so the status picker works there.
+- `ui.rs`: `render_planning` (slot summary line + candidate table with
+  `[n]`/`[ ]` and `was #n` columns), `render_today` (priority / status / task /
+  `carried` tag, empty-state text), `render_task_picker`, `render_confirm`;
+  per-screen footers.
+- `tests/tui.rs`: date-aware harness (`today()`), `row_with` / `row_first_field`
+  helpers, 3 e2e: full pick→carry→swap flow, re-plan overwrite confirmation
+  (decline then accept), Today empty-state + quick status change. 6 new event
+  unit tests.
+- Verified: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (21 unit + 48 integration = 69) all clean.

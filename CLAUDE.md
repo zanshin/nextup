@@ -67,7 +67,8 @@ tests/
 
 ## Status
 
-Phase 5 complete — full task lifecycle driveable from the keyboard.
+Phase 6 complete — the daily planning workflow works end to end. All feature
+phases done; Phase 7 is polish + docs.
 
 - `model`: `Status`/`TaskId`/`Task`, `is_outstanding`/`is_completed`.
 - `store`: `open` + migrations 1 & 2, task CRUD, `children`/`subtree`/`ancestors`,
@@ -75,21 +76,28 @@ Phase 5 complete — full task lifecycle driveable from the keyboard.
   `outstanding_ordered`/`completed_ordered`/`task_row` (`TaskRow`), planning-table
   repository fns. All SQL lives here.
 - `planning`: `candidates`, `commit_session`, `swap_pick`, `plan_for`, `PlanError`.
-- `app`: `Screen`, `Mode`, `Action`, `App`, `Detail`, `Overlay` (line `Editor` /
-  `StatusPicker`). `App::update(action, &mut conn)` is the sole state transition,
-  routed by mode; writes reload every view. No ratatui/crossterm types.
+- `app`: `Screen` (Outstanding/Completed/Detail/Planning/Today), `Mode`
+  (Normal/Editing/Picking/Confirming), `Action`, `App`, `Overlay` (`Editor` /
+  `StatusPicker` / `TaskPicker` / `Confirm`). `App::new(conn, today)`;
+  `App::update(action, &mut conn)` is the sole state transition, routed by mode.
+  Writes reload every view; domain errors surface via `status_message`. No
+  ratatui/crossterm types.
 - `event`: `action_for(KeyEvent, &Screen, Mode) -> Option<Action>`.
-- `ui`: `render(&App, &mut Frame)` — lists, Detail with fold markers, centred
-  editor/picker popups, one-shot `status_message` footer.
-- `main`: DB open → `TerminalGuard` → blocking event loop.
+- `ui`: `render(&App, &mut Frame)` — five screens, fold markers, centred
+  editor/picker/confirm popups, one-shot `status_message` footer.
+- `main`: DB open → `TerminalGuard` → blocking event loop; `today` =
+  `Local::now().date_naive()`.
 
 ### Keybindings
 
 Global: `j/k`+arrows move, `g/G`/Home/End jump, `Enter`/`l` open, `Esc` back
-(quits from Outstanding), `q` / `Ctrl-C` quit, `o`/`c` Outstanding/Completed.
+(quits from Outstanding), `q` / `Ctrl-C` quit, `o`/`c` Outstanding/Completed,
+`s` start planning, `t` today's plan.
 Lists & Detail: `n` new task, `a` subtask, `e`/`E` edit title/notes, `r`
 priority, `space` status picker. Detail: `p` jump to parent, `Tab`/`z` fold.
-`s` is reserved for Phase 6 "start planning".
+Planning: `1/2/3` assign selected candidate to a slot (repeat to unassign),
+`0`/`x` clear, `Enter` commit (confirms before overwriting an existing plan).
+Today: `space` status, `w` swap a top-3 slot (benched task → `on_hold` at 4+).
 
-Covered by 17 unit + 45 integration tests (incl. 14 `TestBackend` e2e). Daily
-planning UI (Planning + Today screens) is Phase 6. See WORKLOG.md.
+Covered by 21 unit + 48 integration tests (incl. 17 `TestBackend` e2e). See
+WORKLOG.md.

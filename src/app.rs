@@ -1,22 +1,28 @@
 //! Terminal-independent application state: the `Screen` enum, the `App` struct,
-//! modal overlays (line editor + status picker), and `update` — the single entry
-//! point that advances state in response to an `Action`. No `ratatui` or
-//! `crossterm` types leak in here, so the whole thing is exercised from tests.
+//! modal overlays (line editor, status picker, task picker, confirm prompt), and
+//! `update` — the single entry point that advances state in response to an
+//! `Action`. No `ratatui` or `crossterm` types leak in here, so the whole thing
+//! is exercised from tests.
 
 use std::collections::HashSet;
 
 use anyhow::{Context, Result};
+use chrono::NaiveDate;
 use rusqlite::Connection;
 
 use crate::model::{Status, Task, TaskId};
+use crate::planning::{self, Candidate, Plan};
 use crate::store::{self, SubtreeNode, TaskRow};
 
-/// Which screen the user is looking at. `Detail` carries the task it is showing.
+/// Which screen the user is looking at. `Detail` carries the task it is showing;
+/// the transient `Planning` / `Today` state lives in `App`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Outstanding,
     Completed,
     Detail(TaskId),
+    Planning,
+    Today,
 }
 
 /// The interaction mode, derived from whichever overlay is open. `event` uses it
@@ -26,6 +32,7 @@ pub enum Mode {
     Normal,
     Editing,
     Picking,
+    Confirming,
 }
 
 /// A high-level, input-independent request to change state. `event` maps key
@@ -52,6 +59,12 @@ pub enum Action {
     EditNotes,
     EditPriority,
     ChangeStatus,
+
+    StartPlanning,
+    ShowToday,
+    AssignSlot(u8),
+    ClearAssignment,
+    SwapSlot,
 
     InsertChar(char),
     Backspace,
@@ -207,11 +220,77 @@ pub struct StatusPicker {
     pub selected: usize,
 }
 
+/// What a chosen task from the `TaskPicker` should be used for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskPickPurpose {
+    /// Swap the chosen task into this top-3 slot of today's plan.
+    SwapSlot(u8),
+}
+
+/// A pick-one-task overlay (a scrollable list of candidate tasks).
+#[derive(Debug, Clone)]
+pub struct TaskPicker {
+    pub prompt: String,
+    pub candidates: Vec<TaskRow>,
+    pub selected: usize,
+    pub purpose: TaskPickPurpose,
+}
+
+/// A deferred action awaiting a yes/no confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingAction {
+    CommitPlan,
+}
+
+/// A yes/no confirmation prompt guarding a destructive action.
+#[derive(Debug, Clone)]
+pub struct Confirm {
+    pub prompt: String,
+    pub action: PendingAction,
+}
+
 /// The modal currently on top of a screen, if any.
 #[derive(Debug, Clone)]
 pub enum Overlay {
     Editor(Editor),
     StatusPicker(StatusPicker),
+    TaskPicker(TaskPicker),
+    Confirm(Confirm),
+}
+
+/// The in-progress state of the Planning screen: the ordered candidate list, the
+/// three chosen slots, and the cursor.
+#[derive(Debug, Clone)]
+pub struct PlanningState {
+    pub date: NaiveDate,
+    pub candidates: Vec<Candidate>,
+    pub picks: [Option<TaskId>; 3],
+    pub selected: usize,
+    /// Whether a plan already existed for `date` when planning began (drives the
+    /// overwrite confirmation).
+    pub has_existing_plan: bool,
+}
+
+impl PlanningState {
+    /// The slot (1..=3) `id` currently occupies, if any.
+    pub fn slot_of(&self, id: TaskId) -> Option<u8> {
+        (1..=3).find(|&n| self.picks[(n - 1) as usize] == Some(id))
+    }
+}
+
+/// The loaded Today screen: the committed plan for `date` (or `None`), plus the
+/// cursor.
+#[derive(Debug, Clone)]
+pub struct TodayState {
+    pub date: NaiveDate,
+    pub plan: Option<Plan>,
+    pub selected: usize,
+}
+
+impl TodayState {
+    fn len(&self) -> usize {
+        self.plan.as_ref().map_or(0, |plan| plan.items.len())
+    }
 }
 
 /// All application state. Screen data is reloaded from the database after every
@@ -220,6 +299,9 @@ pub struct App {
     pub screen: Screen,
     pub should_quit: bool,
 
+    /// The local date treated as "today" for planning. Fixed for the process.
+    pub today: NaiveDate,
+
     pub outstanding: Vec<TaskRow>,
     pub outstanding_selected: usize,
 
@@ -227,6 +309,8 @@ pub struct App {
     pub completed_selected: usize,
 
     pub detail: Option<Detail>,
+    pub planning: Option<PlanningState>,
+    pub todays_plan: Option<TodayState>,
     pub overlay: Option<Overlay>,
 
     /// A one-shot message shown in the footer until the next key press.
@@ -235,15 +319,19 @@ pub struct App {
 
 impl App {
     /// Build the app and load the two list screens. Starts on Outstanding.
-    pub fn new(conn: &Connection) -> Result<Self> {
+    /// `today` is the local date planning treats as the current day.
+    pub fn new(conn: &Connection, today: NaiveDate) -> Result<Self> {
         let mut app = App {
             screen: Screen::Outstanding,
             should_quit: false,
+            today,
             outstanding: Vec::new(),
             outstanding_selected: 0,
             completed: Vec::new(),
             completed_selected: 0,
             detail: None,
+            planning: None,
+            todays_plan: None,
             overlay: None,
             status_message: None,
         };
@@ -259,7 +347,8 @@ impl App {
         match self.overlay {
             None => Mode::Normal,
             Some(Overlay::Editor(_)) => Mode::Editing,
-            Some(Overlay::StatusPicker(_)) => Mode::Picking,
+            Some(Overlay::StatusPicker(_)) | Some(Overlay::TaskPicker(_)) => Mode::Picking,
+            Some(Overlay::Confirm(_)) => Mode::Confirming,
         }
     }
 
@@ -271,6 +360,7 @@ impl App {
         match self.mode() {
             Mode::Editing => self.update_editing(action, conn)?,
             Mode::Picking => self.update_picking(action, conn)?,
+            Mode::Confirming => self.update_confirming(action, conn)?,
             Mode::Normal => self.update_normal(action, conn)?,
         }
 
@@ -283,7 +373,10 @@ impl App {
 
             Action::Back => match self.screen {
                 Screen::Outstanding => self.should_quit = true,
-                _ => self.go_to(Screen::Outstanding, conn)?,
+                _ => {
+                    self.planning = None;
+                    self.go_to(Screen::Outstanding, conn)?;
+                }
             },
 
             Action::ShowOutstanding => self.go_to(Screen::Outstanding, conn)?,
@@ -311,7 +404,18 @@ impl App {
             Action::EditPriority => self.begin_edit_priority(conn)?,
             Action::ChangeStatus => self.begin_change_status(conn)?,
 
-            // Editing-only actions are meaningless here.
+            Action::StartPlanning => self.start_planning(conn)?,
+            Action::ShowToday => self.show_today(conn)?,
+            Action::AssignSlot(slot) => self.assign_slot(slot),
+            Action::ClearAssignment => self.clear_assignment(),
+            Action::SwapSlot => self.begin_swap(conn)?,
+
+            // `Confirm` only reaches normal mode from the Planning screen's
+            // commit key.
+            Action::Confirm if matches!(self.screen, Screen::Planning) => {
+                self.confirm_planning(conn)?;
+            }
+
             _ => {}
         }
 
@@ -339,25 +443,246 @@ impl App {
     }
 
     fn update_picking(&mut self, action: Action, conn: &mut Connection) -> Result<()> {
-        let Some(Overlay::StatusPicker(picker)) = &mut self.overlay else {
-            return Ok(());
-        };
-
-        match action {
-            Action::SelectNext => {
+        // Navigation only touches the picker; do it without disturbing `self`.
+        match (&mut self.overlay, action) {
+            (Some(Overlay::StatusPicker(picker)), Action::SelectNext) => {
                 picker.selected = (picker.selected + 1).min(Status::ALL.len() - 1);
+                return Ok(());
             }
-            Action::SelectPrev => picker.selected = picker.selected.saturating_sub(1),
-            Action::Cancel => self.overlay = None,
-            Action::Confirm => {
-                let target = picker.target;
-                let status = Status::ALL[picker.selected];
-                self.overlay = None;
-                store::set_status(conn, target, status)?;
-                self.reload(conn)?;
+            (Some(Overlay::StatusPicker(picker)), Action::SelectPrev) => {
+                picker.selected = picker.selected.saturating_sub(1);
+                return Ok(());
+            }
+            (Some(Overlay::TaskPicker(picker)), Action::SelectNext) => {
+                let last = picker.candidates.len().saturating_sub(1);
+                picker.selected = (picker.selected + 1).min(last);
+                return Ok(());
+            }
+            (Some(Overlay::TaskPicker(picker)), Action::SelectPrev) => {
+                picker.selected = picker.selected.saturating_sub(1);
+                return Ok(());
             }
             _ => {}
         }
+
+        match action {
+            Action::Cancel => self.overlay = None,
+            Action::Confirm => match self.overlay.take() {
+                Some(Overlay::StatusPicker(picker)) => {
+                    store::set_status(conn, picker.target, Status::ALL[picker.selected])?;
+                    self.reload(conn)?;
+                }
+                Some(Overlay::TaskPicker(picker)) => {
+                    if let Some(chosen) = picker
+                        .candidates
+                        .get(picker.selected)
+                        .map(|row| row.task.id)
+                    {
+                        match picker.purpose {
+                            TaskPickPurpose::SwapSlot(slot) => {
+                                if let Err(err) =
+                                    planning::swap_pick(conn, self.today, slot, chosen)
+                                {
+                                    self.status_message = Some(err.to_string());
+                                }
+                            }
+                        }
+                    }
+                    self.show_today(conn)?;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn update_confirming(&mut self, action: Action, conn: &mut Connection) -> Result<()> {
+        match action {
+            Action::Cancel => self.overlay = None,
+            Action::Confirm => {
+                if let Some(Overlay::Confirm(confirm)) = self.overlay.take() {
+                    match confirm.action {
+                        PendingAction::CommitPlan => self.commit_plan(conn)?,
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    // --- daily planning -----------------------------------------------------
+
+    /// Enter the Planning screen for `today`, pre-filling slots 1/2/3 from any
+    /// plan already committed for the day.
+    fn start_planning(&mut self, conn: &Connection) -> Result<()> {
+        let candidates = planning::candidates(conn, self.today)?;
+        let existing = planning::plan_for(conn, self.today)?;
+
+        let mut picks: [Option<TaskId>; 3] = [None; 3];
+        if let Some(plan) = &existing {
+            for item in &plan.items {
+                if (1..=3).contains(&item.priority) {
+                    picks[(item.priority - 1) as usize] = Some(item.row.task.id);
+                }
+            }
+        }
+
+        self.planning = Some(PlanningState {
+            date: self.today,
+            candidates,
+            picks,
+            selected: 0,
+            has_existing_plan: existing.is_some(),
+        });
+        self.screen = Screen::Planning;
+
+        Ok(())
+    }
+
+    /// Load and show the committed plan for `today` (may be empty / absent).
+    fn show_today(&mut self, conn: &Connection) -> Result<()> {
+        let plan = planning::plan_for(conn, self.today)?;
+        let selected = self.todays_plan.as_ref().map_or(0, |state| state.selected);
+        let len = plan.as_ref().map_or(0, |plan| plan.items.len());
+
+        self.todays_plan = Some(TodayState {
+            date: self.today,
+            plan,
+            selected: clamp_index(selected, len),
+        });
+        self.screen = Screen::Today;
+
+        Ok(())
+    }
+
+    fn assign_slot(&mut self, slot_number: u8) {
+        if !(1..=3).contains(&slot_number) {
+            return;
+        }
+        let Some(state) = &mut self.planning else {
+            return;
+        };
+        let Some(candidate) = state.candidates.get(state.selected) else {
+            return;
+        };
+
+        let id = candidate.row.task.id;
+        let index = (slot_number - 1) as usize;
+
+        if state.picks[index] == Some(id) {
+            state.picks[index] = None; // pressing the same number again unassigns
+            return;
+        }
+
+        for pick in &mut state.picks {
+            if *pick == Some(id) {
+                *pick = None; // moved out of whatever slot it was in
+            }
+        }
+        state.picks[index] = Some(id);
+    }
+
+    fn clear_assignment(&mut self) {
+        let Some(state) = &mut self.planning else {
+            return;
+        };
+        let Some(candidate) = state.candidates.get(state.selected) else {
+            return;
+        };
+
+        let id = candidate.row.task.id;
+        for pick in &mut state.picks {
+            if *pick == Some(id) {
+                *pick = None;
+            }
+        }
+    }
+
+    /// Commit today's picks, or raise the overwrite confirmation first if a plan
+    /// already existed.
+    fn confirm_planning(&mut self, conn: &mut Connection) -> Result<()> {
+        let has_existing = self
+            .planning
+            .as_ref()
+            .is_some_and(|state| state.has_existing_plan);
+
+        if has_existing {
+            self.overlay = Some(Overlay::Confirm(Confirm {
+                prompt: "Re-plan today? This replaces the current plan.".to_string(),
+                action: PendingAction::CommitPlan,
+            }));
+        } else {
+            self.commit_plan(conn)?;
+        }
+
+        Ok(())
+    }
+
+    fn commit_plan(&mut self, conn: &mut Connection) -> Result<()> {
+        let Some(state) = &self.planning else {
+            return Ok(());
+        };
+        let date = state.date;
+        let picks = state.picks;
+
+        match planning::commit_session(conn, date, picks) {
+            Ok(_) => {
+                self.planning = None;
+                self.show_today(conn)?;
+            }
+            Err(err) => self.status_message = Some(err.to_string()),
+        }
+
+        Ok(())
+    }
+
+    /// Open a task picker to swap the selected top-3 item out of today's plan.
+    fn begin_swap(&mut self, conn: &Connection) -> Result<()> {
+        let (slot, top_three) = {
+            let Some(state) = &self.todays_plan else {
+                return Ok(());
+            };
+            let Some(plan) = &state.plan else {
+                return Ok(());
+            };
+            let Some(item) = plan.items.get(state.selected) else {
+                return Ok(());
+            };
+            if item.priority > 3 {
+                self.status_message = Some("only slots 1-3 can be swapped".to_string());
+                return Ok(());
+            }
+
+            let top_three: Vec<TaskId> = plan
+                .items
+                .iter()
+                .filter(|item| item.priority <= 3)
+                .map(|item| item.row.task.id)
+                .collect();
+
+            (item.priority as u8, top_three)
+        };
+
+        let candidates: Vec<TaskRow> = store::outstanding_ordered(conn)?
+            .into_iter()
+            .filter(|row| !top_three.contains(&row.task.id))
+            .collect();
+
+        if candidates.is_empty() {
+            self.status_message = Some("no other outstanding tasks to swap in".to_string());
+            return Ok(());
+        }
+
+        self.overlay = Some(Overlay::TaskPicker(TaskPicker {
+            prompt: format!("Swap into slot {slot}"),
+            candidates,
+            selected: 0,
+            purpose: TaskPickPurpose::SwapSlot(slot),
+        }));
 
         Ok(())
     }
@@ -494,6 +819,8 @@ impl App {
                 self.screen = Screen::Completed;
             }
             Screen::Detail(id) => self.open_detail(conn, id)?,
+            // Planning / Today are entered through their own helpers.
+            Screen::Planning | Screen::Today => self.screen = screen,
         }
 
         Ok(())
@@ -564,8 +891,10 @@ impl App {
         self.load_outstanding(conn)?;
         self.load_completed(conn)?;
 
-        if let Screen::Detail(id) = self.screen {
-            self.reload_detail(conn, id)?;
+        match self.screen {
+            Screen::Detail(id) => self.reload_detail(conn, id)?,
+            Screen::Today => self.show_today(conn)?,
+            _ => {}
         }
 
         Ok(())
@@ -582,6 +911,8 @@ impl App {
                 .get(self.completed_selected)
                 .map(|row| row.task.id),
             Screen::Detail(_) => self.detail.as_ref().and_then(Detail::selected_visible_id),
+            // Planning / Today have no drill-in from `Enter`.
+            Screen::Planning | Screen::Today => None,
         };
 
         if let Some(id) = target {
@@ -622,7 +953,7 @@ impl App {
     // --- targeting -------------------------------------------------------------
 
     /// The task id an editing/status action operates on: the selected list row,
-    /// or the task being shown on the Detail screen.
+    /// the task shown on Detail, or the selected candidate / plan item.
     fn action_target(&self) -> Option<TaskId> {
         match self.screen {
             Screen::Outstanding => self
@@ -634,6 +965,21 @@ impl App {
                 .get(self.completed_selected)
                 .map(|row| row.task.id),
             Screen::Detail(id) => Some(id),
+            Screen::Planning => self
+                .planning
+                .as_ref()
+                .and_then(|state| state.candidates.get(state.selected))
+                .map(|candidate| candidate.row.task.id),
+            Screen::Today => self
+                .todays_plan
+                .as_ref()
+                .and_then(|state| {
+                    state
+                        .plan
+                        .as_ref()
+                        .and_then(|plan| plan.items.get(state.selected))
+                })
+                .map(|item| item.row.task.id),
         }
     }
 
@@ -662,7 +1008,7 @@ impl App {
         *selected = clamp_index(target, len);
     }
 
-    /// `(row count, &mut selection index)` for the active screen's list. Detail
+    /// `(row count, &mut selection index)` for the active screen's list. A screen
     /// with no loaded data reports an empty list.
     fn active_list_mut(&mut self) -> (usize, &mut usize) {
         match self.screen {
@@ -672,6 +1018,17 @@ impl App {
                 Some(detail) => {
                     let len = detail.visible_len();
                     (len, &mut detail.selected)
+                }
+                None => (0, &mut self.outstanding_selected),
+            },
+            Screen::Planning => match &mut self.planning {
+                Some(state) => (state.candidates.len(), &mut state.selected),
+                None => (0, &mut self.outstanding_selected),
+            },
+            Screen::Today => match &mut self.todays_plan {
+                Some(state) => {
+                    let len = state.len();
+                    (len, &mut state.selected)
                 }
                 None => (0, &mut self.outstanding_selected),
             },
