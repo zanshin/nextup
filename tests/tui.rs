@@ -5,7 +5,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nextup::app::{App, Screen};
-use nextup::model::Status;
+use nextup::model::{Status, Task, TaskId};
 use nextup::{event, store, ui};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -39,9 +39,22 @@ impl Tui {
 
     /// Feed one unmodified key press through the real input pipeline.
     fn press(&mut self, code: KeyCode) -> &mut Self {
-        let key = KeyEvent::new(code, KeyModifiers::NONE);
-        if let Some(action) = event::action_for(key, &self.app.screen) {
-            self.app.update(action, &self.conn).expect("update");
+        self.key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// Feed an arbitrary key event (for modifiers).
+    fn key(&mut self, key: KeyEvent) -> &mut Self {
+        if let Some(action) = event::action_for(key, &self.app.screen, self.app.mode()) {
+            self.app.update(action, &mut self.conn).expect("update");
+        }
+
+        self
+    }
+
+    /// Type a string one character at a time (an editor overlay must be open).
+    fn typ(&mut self, text: &str) -> &mut Self {
+        for ch in text.chars() {
+            self.press(KeyCode::Char(ch));
         }
 
         self
@@ -104,6 +117,24 @@ fn data_rows(screen: &str) -> Vec<&str> {
         .skip(2)
         .take_while(|line| !line.trim().is_empty())
         .collect()
+}
+
+/// The currently highlighted data row (the one carrying the `> ` marker).
+fn selected_row(screen: &str) -> &str {
+    data_rows(screen)
+        .into_iter()
+        .find(|line| line.starts_with("> "))
+        .unwrap_or_else(|| panic!("no selected row in:\n{screen}"))
+}
+
+fn task_by_title(conn: &Connection, title: &str) -> Task {
+    let id: i64 = conn
+        .query_row("SELECT id FROM tasks WHERE title = ?1", [title], |row| {
+            row.get(0)
+        })
+        .unwrap_or_else(|_| panic!("no task titled {title:?}"));
+
+    store::get(conn, TaskId(id)).unwrap().unwrap()
 }
 
 #[test]
@@ -229,4 +260,178 @@ fn empty_database_renders_an_empty_state() {
 
     tui.press(KeyCode::Char('c'));
     assert!(tui.screen().contains("Nothing completed yet."));
+}
+
+// --- Phase 5: writes from the keyboard ------------------------------------
+
+#[test]
+fn create_edit_and_cascade_lifecycle_is_driveable_from_the_keyboard() {
+    let mut tui = Tui::new(|_conn| {});
+
+    // create a root task
+    tui.press(KeyCode::Char('n'))
+        .typ("Ship release")
+        .press(KeyCode::Enter);
+    assert!(tui.screen().contains("Ship release"));
+
+    // add two subtasks to it (it is the selected row)
+    tui.press(KeyCode::Char('a'))
+        .typ("Write notes")
+        .press(KeyCode::Enter);
+    tui.press(KeyCode::Char('a'))
+        .typ("Cut tag")
+        .press(KeyCode::Enter);
+
+    let screen = tui.screen();
+    let rows = data_rows(&screen);
+    assert!(rows[0].contains("Ship release"));
+    assert!(rows.iter().any(|row| row.contains("Write notes")));
+    assert!(rows.iter().any(|row| row.contains("Cut tag")));
+
+    // select "Write notes" and move it to in_progress via the picker
+    tui.press(KeyCode::Char('j'));
+    assert!(selected_row(&tui.screen()).contains("Write notes"));
+    tui.press(KeyCode::Char(' ')) // open picker (current = new)
+        .press(KeyCode::Char('j')) // -> in_progress
+        .press(KeyCode::Enter);
+
+    // in_progress sorts to the top of Outstanding
+    assert!(data_rows(&tui.screen())[0].contains("Write notes"));
+
+    // select the parent and mark it done
+    tui.press(KeyCode::Char('g')).press(KeyCode::Char('j'));
+    assert!(selected_row(&tui.screen()).contains("Ship release"));
+    tui.press(KeyCode::Char(' '));
+    for _ in 0..5 {
+        tui.press(KeyCode::Char('j')); // new -> done
+    }
+    tui.press(KeyCode::Enter);
+
+    // the whole subtree cascaded closed
+    assert!(tui.screen().contains("No outstanding tasks."));
+
+    tui.press(KeyCode::Char('c'));
+    let screen = tui.screen();
+    for title in ["Ship release", "Write notes", "Cut tag"] {
+        assert!(
+            line_containing(&screen, title).contains("done"),
+            "{title} is done"
+        );
+    }
+
+    // cascade stamped one completion time across all three
+    let parent = task_by_title(&tui.conn, "Ship release");
+    let child_a = task_by_title(&tui.conn, "Write notes");
+    let child_b = task_by_title(&tui.conn, "Cut tag");
+    assert!(parent.completed_at.is_some());
+    assert_eq!(parent.completed_at, child_a.completed_at);
+    assert_eq!(parent.completed_at, child_b.completed_at);
+}
+
+#[test]
+fn editing_a_title_propagates_to_breadcrumbs() {
+    let mut tui = Tui::new(seed_tree);
+
+    tui.press(KeyCode::Char('j')); // select "Write book"
+    tui.press(KeyCode::Char('e'));
+    for _ in 0..40 {
+        tui.press(KeyCode::Backspace);
+    }
+    tui.typ("Write the book").press(KeyCode::Enter);
+
+    let screen = tui.screen();
+    assert!(screen.contains("Write the book"));
+    assert!(
+        !screen.contains("(Write book /"),
+        "renamed task no longer appears in children's breadcrumbs",
+    );
+}
+
+#[test]
+fn cancelling_the_editor_changes_nothing() {
+    let mut tui = Tui::new(seed_tree);
+
+    tui.press(KeyCode::Char('j')).press(KeyCode::Char('e'));
+    tui.typ("ZZZ").press(KeyCode::Esc);
+
+    let screen = tui.screen();
+    assert!(!screen.contains("ZZZ"));
+    assert!(selected_row(&screen).contains("Write book"));
+}
+
+#[test]
+fn setting_then_clearing_a_priority() {
+    let mut tui = Tui::new(seed_tree);
+    tui.press(KeyCode::Char('j')); // "Write book"
+
+    tui.press(KeyCode::Char('r')).typ("2").press(KeyCode::Enter);
+    assert!(
+        selected_row(&tui.screen())
+            .trim_start_matches("> ")
+            .starts_with('2'),
+        "priority column shows 2",
+    );
+
+    // a non-number is rejected and reported
+    tui.press(KeyCode::Char('r')).typ("x").press(KeyCode::Enter);
+    assert!(tui.screen().contains("priority must be"));
+    tui.press(KeyCode::Esc);
+
+    // blank clears it
+    tui.press(KeyCode::Char('r'))
+        .press(KeyCode::Backspace)
+        .press(KeyCode::Enter);
+    assert!(
+        selected_row(&tui.screen())
+            .trim_start_matches("> ")
+            .starts_with('-'),
+    );
+}
+
+#[test]
+fn detail_subtree_folds_and_unfolds() {
+    let mut tui = Tui::new(seed_tree);
+
+    tui.press(KeyCode::Char('j')).press(KeyCode::Enter); // "Write book" detail
+    let screen = tui.screen();
+    assert!(screen.contains("Chapter 1"));
+    assert!(screen.contains("Outline ch1"));
+
+    // the subtree selection starts on "Chapter 1"; fold it
+    tui.press(KeyCode::Tab);
+    let screen = tui.screen();
+    assert!(
+        screen.contains("[+] "),
+        "a folded parent shows the [+] marker"
+    );
+    assert!(!screen.contains("Outline ch1"), "the grandchild is hidden");
+    assert!(screen.contains("Chapter 2"), "the sibling stays visible");
+
+    tui.press(KeyCode::Tab);
+    assert!(tui.screen().contains("Outline ch1"));
+}
+
+#[test]
+fn editing_notes_from_the_detail_screen() {
+    let mut tui = Tui::new(seed_tree);
+
+    tui.press(KeyCode::Char('G')).press(KeyCode::Enter); // "Buy groceries" detail
+    tui.press(KeyCode::Char('E'))
+        .typ("milk, eggs")
+        .press(KeyCode::Enter);
+
+    assert!(tui.screen().contains("milk, eggs"));
+}
+
+#[test]
+fn ctrl_c_quits_even_with_an_editor_open() {
+    let mut tui = Tui::new(seed_tree);
+
+    tui.press(KeyCode::Char('n')).typ("half typed");
+    tui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+    // editor cancelled, nothing created, still running
+    assert!(tui.app.overlay.is_none());
+    assert!(!tui.screen().contains("half typed"));
+    assert!(!tui.app.should_quit);
 }

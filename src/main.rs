@@ -46,28 +46,28 @@ fn main() -> anyhow::Result<()> {
 fn run(args: Args) -> Result<()> {
     install_panic_hook();
 
-    let conn = store::open(&args.db_path)
+    let mut conn = store::open(&args.db_path)
         .with_context(|| format!("opening database at {}", args.db_path.display()))?;
 
     let _guard = TerminalGuard::new().context("taking over the terminal")?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     let mut app = App::new(&conn)?;
-    event_loop(&mut terminal, &mut app, &conn)
+    event_loop(&mut terminal, &mut app, &mut conn)
 }
 
 /// Draw, block for one key, translate it, apply it. Repeat until `should_quit`.
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    conn: &rusqlite::Connection,
+    conn: &mut rusqlite::Connection,
 ) -> Result<()> {
     while !app.should_quit {
         terminal.draw(|frame| ui::render(app, frame))?;
 
         if let Event::Key(key) = read()?
             && key.kind != KeyEventKind::Release
-            && let Some(action) = event::action_for(key, &app.screen)
+            && let Some(action) = event::action_for(key, &app.screen, app.mode())
         {
             app.update(action, conn)?;
         }

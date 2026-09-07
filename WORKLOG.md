@@ -149,3 +149,43 @@
 - Verified: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test` (12 unit + 38 integration = 50) all clean. Binary confirmed to
   create/migrate the DB before terminal setup.
+
+## 2026-09-07 — Phase 5: TUI task management (writes)
+
+- `app.rs`:
+  - `Mode` (Normal / Editing / Picking) derived from `App.overlay`.
+  - `Overlay::Editor(Editor)` — single-line editor with a `char`-boundary
+    cursor (insert / backspace / left / right / home / end), an `EditTarget`
+    (NewRootTask, NewSubtaskOf, Title, Notes, Priority), and a label.
+  - `Overlay::StatusPicker(StatusPicker)` — target task + index into
+    `Status::ALL`.
+  - `App.update(&mut self, action, &mut Connection)` now routes by mode;
+    `status_message` is a one-shot footer note cleared on the next key.
+  - Openers (`n`/`a`/`e`/`E`/`r`/space) target the selected list row or, on
+    Detail, the shown task. Commit paths call `store::create_task` /
+    `create_subtask` / `update_fields` / `set_status`, then `reload` every
+    view (Detail reload keeps selection + folds, prunes stale collapsed ids).
+  - Priority editor: blank clears, otherwise a whole number ≥ 1; bad input
+    keeps the overlay open with a message.
+  - Detail folding: `collapsed: HashSet<TaskId>`; `visible_descendants`
+    walks the pre-order subtree skipping anything under a collapsed node and
+    tags each row with `has_children` / `collapsed`.
+- `event.rs`: `action_for(key, &Screen, Mode)`. Editing mode → text actions
+  (`Char` → `InsertChar`, Enter → `Confirm`, Esc/Ctrl-C → `Cancel`). Picking
+  mode → `j`/`k` move, Enter/space `Confirm`, Esc/`q` `Cancel`. Normal mode:
+  `n` new, `a` subtask, `e`/`E` title/notes, `r` priority, space status,
+  `Tab`/`z` fold (Detail). `s` left free for Phase 6 planning. 5 unit tests.
+- `ui.rs`: fold markers (`[+]`/`[-]`) in the Detail subtree; centred popups
+  (`Clear` + bordered `Block`) for the editor (with real `set_cursor_position`)
+  and the status picker; footer shows `status_message` when set, else
+  screen-specific help (overlay help while a modal is open).
+- `main.rs`: `event_loop` takes `&mut Connection`; passes `app.mode()` to
+  `action_for`.
+- `tests/tui.rs`: `typ` / `key` / `selected_row` / `task_by_title` helpers;
+  7 new e2e tests including the full plan scenario (create task → 2 subtasks
+  → subtask to in_progress reorders to top → parent done cascades into
+  Completed with one shared `completed_at`), plus title-edit breadcrumb
+  propagation, editor cancel, priority set/reject/clear, fold/unfold, notes
+  edit, and Ctrl-C from an open editor.
+- Verified: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (17 unit + 45 integration = 62) all clean.

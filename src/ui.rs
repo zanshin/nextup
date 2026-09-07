@@ -1,27 +1,34 @@
 //! Rendering. `render(&App, &mut Frame)` draws the active screen as a header
-//! line, a body, and a context-sensitive help footer. This module only reads
-//! `App`; it never changes state. Selection is drawn with a literal `> ` marker
-//! so it is visible in plain-text snapshots.
+//! line, a body, and a context-sensitive footer, then any open overlay (the
+//! line editor or the status picker) as a centred popup. This module only reads
+//! `App`. Selection is drawn with a literal `> ` marker so it shows in
+//! plain-text snapshots.
 
 use chrono::{DateTime, Local, Utc};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, HighlightSpacing, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, HighlightSpacing, Paragraph, Row, Table, TableState, Wrap,
+};
 
-use crate::app::{App, Detail, Screen};
+use crate::app::{App, Detail, Editor, Overlay, Screen, StatusPicker};
+use crate::model::Status;
 use crate::store::TaskRow;
 
 const SELECTED: &str = "> ";
+const UNSELECTED: &str = "  ";
 
 pub fn render(app: &App, frame: &mut Frame) {
+    let full = frame.area();
+
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
-    .areas(frame.area());
+    .areas(full);
 
     frame.render_widget(Paragraph::new(header_text(app)), header);
 
@@ -31,10 +38,13 @@ pub fn render(app: &App, frame: &mut Frame) {
         Screen::Detail(_) => render_detail(app, frame, body),
     }
 
-    frame.render_widget(
-        Paragraph::new(footer_text(app)).style(Style::new().add_modifier(Modifier::DIM)),
-        footer,
-    );
+    frame.render_widget(footer_widget(app), footer);
+
+    match &app.overlay {
+        Some(Overlay::Editor(editor)) => render_editor(editor, frame, full),
+        Some(Overlay::StatusPicker(picker)) => render_status_picker(picker, frame, full),
+        None => {}
+    }
 }
 
 fn header_text(app: &App) -> String {
@@ -47,14 +57,25 @@ fn header_text(app: &App) -> String {
     format!("nextup — {title}")
 }
 
-fn footer_text(app: &App) -> &'static str {
-    match app.screen {
-        Screen::Outstanding => "j/k move · enter detail · c completed · q quit",
-        Screen::Completed => "j/k move · enter detail · o outstanding · q quit",
-        Screen::Detail(_) => {
-            "j/k move · enter open subtask · p parent · o outstanding · c completed · esc back"
-        }
+fn footer_widget(app: &App) -> Paragraph<'_> {
+    if let Some(message) = &app.status_message {
+        return Paragraph::new(message.as_str()).style(Style::new().add_modifier(Modifier::BOLD));
     }
+
+    let help = if app.overlay.is_some() {
+        "enter confirm · esc cancel"
+    } else {
+        match app.screen {
+            Screen::Outstanding | Screen::Completed => {
+                "j/k move · enter detail · n new · a subtask · e/E title/notes · r priority · space status · o/c switch · q quit"
+            }
+            Screen::Detail(_) => {
+                "j/k move · enter open · p parent · tab fold · n/a new/subtask · e/E title/notes · r priority · space status · esc back"
+            }
+        }
+    };
+
+    Paragraph::new(help).style(Style::new().add_modifier(Modifier::DIM))
 }
 
 fn render_outstanding(app: &App, frame: &mut Frame, area: Rect) {
@@ -133,17 +154,23 @@ fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
         info,
     );
 
-    let descendants = detail.descendants();
-    if descendants.is_empty() {
+    let visible = detail.visible_descendants();
+    if visible.is_empty() {
         frame.render_widget(Paragraph::new("(no subtasks)"), subtasks);
         return;
     }
 
-    let rows = descendants.iter().map(|node| {
-        let indent = "  ".repeat(node.depth.saturating_sub(1));
+    let rows = visible.iter().map(|entry| {
+        let indent = "  ".repeat(entry.node.depth.saturating_sub(1));
+        let marker = match (entry.has_children, entry.collapsed) {
+            (true, true) => "[+] ",
+            (true, false) => "[-] ",
+            (false, _) => "",
+        };
+
         Row::new([
-            format!("{indent}{}", node.task.title),
-            node.task.status.to_string(),
+            format!("{indent}{marker}{}", entry.node.task.title),
+            entry.node.task.status.to_string(),
         ])
     });
 
@@ -183,7 +210,7 @@ fn info_lines(detail: &Detail) -> Vec<Line<'static>> {
 }
 
 /// Render a `Table` with a leading selection-marker column so the highlighted
-/// row is visible in a plain-text buffer, not just via style.
+/// row shows in a plain-text buffer, not just via style.
 fn render_list(frame: &mut Frame, area: Rect, table: Table<'_>, selected: usize) {
     let mut state = TableState::default();
     state.select(Some(selected));
@@ -194,6 +221,69 @@ fn render_list(frame: &mut Frame, area: Rect, table: Table<'_>, selected: usize)
         .highlight_spacing(HighlightSpacing::Always);
 
     frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn render_editor(editor: &Editor, frame: &mut Frame, area: Rect) {
+    let popup = centered_rect(60, 5, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::bordered().title(format!(" {} ", editor.label));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let [input, _gap, hint] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    frame.render_widget(Paragraph::new(editor.buffer.as_str()), input);
+    frame.render_widget(
+        Paragraph::new("enter save · esc cancel").style(Style::new().add_modifier(Modifier::DIM)),
+        hint,
+    );
+
+    let cursor_col = editor.buffer[..editor.cursor].chars().count() as u16;
+    let max_col = input.x + input.width.saturating_sub(1);
+    frame.set_cursor_position(((input.x + cursor_col).min(max_col), input.y));
+}
+
+fn render_status_picker(picker: &StatusPicker, frame: &mut Frame, area: Rect) {
+    let height = (Status::ALL.len() + 2) as u16;
+    let popup = centered_rect(30, height, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::bordered().title(" Status ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let lines: Vec<Line<'static>> = Status::ALL
+        .iter()
+        .enumerate()
+        .map(|(index, status)| {
+            let marker = if index == picker.selected {
+                SELECTED
+            } else {
+                UNSELECTED
+            };
+            Line::from(format!("{marker}{status}"))
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+
+    Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    }
 }
 
 fn title_cell(row: &TaskRow) -> String {

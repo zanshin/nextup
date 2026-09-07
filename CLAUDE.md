@@ -67,7 +67,7 @@ tests/
 
 ## Status
 
-Phase 4 complete — navigable read-only TUI over real data.
+Phase 5 complete — full task lifecycle driveable from the keyboard.
 
 - `model`: `Status`/`TaskId`/`Task`, `is_outstanding`/`is_completed`.
 - `store`: `open` + migrations 1 & 2, task CRUD, `children`/`subtree`/`ancestors`,
@@ -75,13 +75,21 @@ Phase 4 complete — navigable read-only TUI over real data.
   `outstanding_ordered`/`completed_ordered`/`task_row` (`TaskRow`), planning-table
   repository fns. All SQL lives here.
 - `planning`: `candidates`, `commit_session`, `swap_pick`, `plan_for`, `PlanError`.
-- `app`: `Screen`, `Action`, `App`, `Detail`; `App::update(action, &conn)` is the
-  sole state transition. No ratatui/crossterm types.
-- `event`: `action_for(KeyEvent, &Screen) -> Option<Action>` (context-sensitive).
-- `ui`: `render(&App, &mut Frame)` — Outstanding/Completed/Detail, `> ` selection
-  marker, help footer, empty states.
-- `main`: DB open → `TerminalGuard` (raw mode + alt screen, restored on Drop &
-  panic) → blocking event loop.
+- `app`: `Screen`, `Mode`, `Action`, `App`, `Detail`, `Overlay` (line `Editor` /
+  `StatusPicker`). `App::update(action, &mut conn)` is the sole state transition,
+  routed by mode; writes reload every view. No ratatui/crossterm types.
+- `event`: `action_for(KeyEvent, &Screen, Mode) -> Option<Action>`.
+- `ui`: `render(&App, &mut Frame)` — lists, Detail with fold markers, centred
+  editor/picker popups, one-shot `status_message` footer.
+- `main`: DB open → `TerminalGuard` → blocking event loop.
 
-Covered by 12 unit + 38 integration tests (incl. 7 `TestBackend` e2e). Writes
-(create/edit/status changes from the UI) arrive in Phase 5. See WORKLOG.md.
+### Keybindings
+
+Global: `j/k`+arrows move, `g/G`/Home/End jump, `Enter`/`l` open, `Esc` back
+(quits from Outstanding), `q` / `Ctrl-C` quit, `o`/`c` Outstanding/Completed.
+Lists & Detail: `n` new task, `a` subtask, `e`/`E` edit title/notes, `r`
+priority, `space` status picker. Detail: `p` jump to parent, `Tab`/`z` fold.
+`s` is reserved for Phase 6 "start planning".
+
+Covered by 17 unit + 45 integration tests (incl. 14 `TestBackend` e2e). Daily
+planning UI (Planning + Today screens) is Phase 6. See WORKLOG.md.
