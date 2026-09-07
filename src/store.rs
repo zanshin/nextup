@@ -140,6 +140,83 @@ pub fn delete(conn: &Connection, id: TaskId) -> Result<()> {
     Ok(())
 }
 
+/// The outstanding status values as an SQL tuple. Must match the variants
+/// `model::Status::is_outstanding` returns true for.
+const OUTSTANDING_SQL: &str = "('new','in_progress','on_hold','waiting')";
+
+/// The completed status values as an SQL tuple.
+const COMPLETED_SQL: &str = "('abandoned','done')";
+
+/// Change a task's status, applying the completion rules:
+///
+/// - To a completed status: set `completed_at` to now if it was null (keep an
+///   existing value otherwise), then give every still-outstanding descendant the
+///   same status and that *same* timestamp.
+/// - To an outstanding status: clear this row's `completed_at` only. Descendants
+///   are left untouched — reopening does not un-cascade.
+pub fn set_status(conn: &mut Connection, id: TaskId, status: Status) -> Result<()> {
+    let tx = conn
+        .transaction()
+        .context("beginning set_status transaction")?;
+
+    if status.is_completed() {
+        let now = to_rfc3339(Utc::now());
+
+        let updated = tx
+            .execute(
+                "UPDATE tasks
+                 SET status = ?2, completed_at = COALESCE(completed_at, ?3)
+                 WHERE id = ?1",
+                rusqlite::params![id.value(), status.as_str(), now],
+            )
+            .context("completing task")?;
+
+        if updated == 0 {
+            anyhow::bail!("no task with id {id}");
+        }
+
+        // Read back the effective timestamp so descendants share it exactly.
+        let stamp: String = tx
+            .query_row(
+                "SELECT completed_at FROM tasks WHERE id = ?1",
+                [id.value()],
+                |row| row.get(0),
+            )
+            .context("reading completion timestamp")?;
+
+        tx.execute(
+            &format!(
+                "WITH RECURSIVE descendants(id) AS (
+                     SELECT id FROM tasks WHERE parent_id = ?1
+                   UNION ALL
+                     SELECT t.id FROM tasks t JOIN descendants d ON t.parent_id = d.id
+                 )
+                 UPDATE tasks
+                 SET status = ?2, completed_at = ?3
+                 WHERE id IN (SELECT id FROM descendants)
+                   AND status IN {OUTSTANDING_SQL}"
+            ),
+            rusqlite::params![id.value(), status.as_str(), stamp],
+        )
+        .context("cascading completion to descendants")?;
+    } else {
+        let updated = tx
+            .execute(
+                "UPDATE tasks SET status = ?2, completed_at = NULL WHERE id = ?1",
+                rusqlite::params![id.value(), status.as_str()],
+            )
+            .context("reopening task")?;
+
+        if updated == 0 {
+            anyhow::bail!("no task with id {id}");
+        }
+    }
+
+    tx.commit().context("committing set_status transaction")?;
+
+    Ok(())
+}
+
 /// Direct children of `parent`, oldest first (`id` breaks timestamp ties).
 pub fn children(conn: &Connection, parent: TaskId) -> Result<Vec<Task>> {
     let mut stmt = conn.prepare(&format!(
@@ -211,6 +288,70 @@ pub fn ancestors(conn: &Connection, id: TaskId) -> Result<Vec<Task>> {
         .context("reading ancestors")?;
 
     Ok(tasks)
+}
+
+/// A task paired with its ancestor breadcrumb (ancestor titles, root first), for
+/// the flat lists the UI renders. Empty breadcrumb for a top-level task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRow {
+    pub task: Task,
+    pub breadcrumb: Vec<String>,
+}
+
+/// Every outstanding task in daily-planning order: `in_progress`, then `on_hold`,
+/// then the rest; oldest first within each group. Feeds the Outstanding screen
+/// and the planning candidate list.
+pub fn outstanding_ordered(conn: &Connection) -> Result<Vec<TaskRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {TASK_COLUMNS} FROM tasks
+         WHERE status IN {OUTSTANDING_SQL}
+         ORDER BY CASE status
+                    WHEN 'in_progress' THEN 0
+                    WHEN 'on_hold' THEN 1
+                    ELSE 2
+                  END,
+                  created_at ASC, id ASC"
+    ))?;
+
+    let tasks = stmt
+        .query_map([], row_to_task)?
+        .collect::<rusqlite::Result<Vec<Task>>>()
+        .context("reading outstanding tasks")?;
+
+    with_breadcrumbs(conn, tasks)
+}
+
+/// Every completed task, newest completion first (`id` ascending breaks a shared
+/// timestamp so a cascaded parent lists before its children).
+pub fn completed_ordered(conn: &Connection) -> Result<Vec<TaskRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {TASK_COLUMNS} FROM tasks
+         WHERE status IN {COMPLETED_SQL}
+         ORDER BY completed_at DESC, id ASC"
+    ))?;
+
+    let tasks = stmt
+        .query_map([], row_to_task)?
+        .collect::<rusqlite::Result<Vec<Task>>>()
+        .context("reading completed tasks")?;
+
+    with_breadcrumbs(conn, tasks)
+}
+
+/// Attach each task's ancestor breadcrumb. One `ancestors` query per row, which
+/// is fine at the scale of a personal to-do list.
+fn with_breadcrumbs(conn: &Connection, tasks: Vec<Task>) -> Result<Vec<TaskRow>> {
+    tasks
+        .into_iter()
+        .map(|task| {
+            let breadcrumb = ancestors(conn, task.id)?
+                .into_iter()
+                .map(|ancestor| ancestor.title)
+                .collect();
+
+            Ok(TaskRow { task, breadcrumb })
+        })
+        .collect()
 }
 
 // --- row mapping -------------------------------------------------------------

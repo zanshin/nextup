@@ -67,8 +67,10 @@ tests/
 
 ## Status
 
-Phase 1 complete: `model` (`Status`/`TaskId`/`Task`) and `store` (`open` +
-migration 1 + task CRUD + `children`/`subtree`/`ancestors` CTEs + cascade delete),
-covered by 4 unit + 10 integration tests. `main.rs` does not open the store yet —
-that lands with the Phase 4 event loop. See WORKLOG.md and the plan for the phase
-breakdown.
+Phase 2 complete. `model` has `Status`/`TaskId`/`Task` plus `is_outstanding` /
+`is_completed`. `store` has `open` + migration 1, task CRUD,
+`children`/`subtree`/`ancestors` CTEs, cascade delete, `set_status` (completion
+timestamp + cascade rules), and `outstanding_ordered` / `completed_ordered`
+returning `TaskRow { task, breadcrumb }`. Covered by 5 unit + 16 integration
+tests. `main.rs` does not open the store yet — that lands with the Phase 4 event
+loop. See WORKLOG.md and the plan for the phase breakdown.

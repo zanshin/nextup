@@ -41,6 +41,21 @@ impl Status {
             Status::Done => "done",
         }
     }
+
+    /// Whether the task still counts as open work. The complement, `is_completed`,
+    /// covers exactly `Done` and `Abandoned`.
+    pub fn is_outstanding(self) -> bool {
+        matches!(
+            self,
+            Status::New | Status::InProgress | Status::OnHold | Status::Waiting
+        )
+    }
+
+    /// Whether the task is finished (`Done` or `Abandoned`) and therefore carries
+    /// a `completed_at` timestamp.
+    pub fn is_completed(self) -> bool {
+        !self.is_outstanding()
+    }
 }
 
 impl fmt::Display for Status {
@@ -131,6 +146,37 @@ mod tests {
             "sideways".parse::<Status>(),
             Err(UnknownStatus("sideways".to_owned())),
         );
+    }
+
+    #[test]
+    fn outstanding_and_completed_partition_the_status_set() {
+        let outstanding: Vec<Status> = Status::ALL
+            .into_iter()
+            .filter(|s| s.is_outstanding())
+            .collect();
+        assert_eq!(
+            outstanding,
+            vec![
+                Status::New,
+                Status::InProgress,
+                Status::OnHold,
+                Status::Waiting,
+            ],
+        );
+
+        let completed: Vec<Status> = Status::ALL
+            .into_iter()
+            .filter(|s| s.is_completed())
+            .collect();
+        assert_eq!(completed, vec![Status::Abandoned, Status::Done]);
+
+        for status in Status::ALL {
+            assert_ne!(
+                status.is_outstanding(),
+                status.is_completed(),
+                "{status} must be in exactly one set",
+            );
+        }
     }
 
     #[test]

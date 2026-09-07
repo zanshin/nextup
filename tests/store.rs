@@ -2,6 +2,8 @@
 //! the subtree / ancestors recursive CTEs, and cascade delete via the foreign
 //! key. Every test runs against a throwaway file created by `tempfile`.
 
+use std::time::Duration;
+
 use nextup::model::{Status, TaskId};
 use nextup::store;
 use rusqlite::Connection;
@@ -175,5 +177,174 @@ fn delete_cascades_to_every_descendant() {
     assert!(
         store::get(&conn, sibling).unwrap().is_some(),
         "unrelated tasks are untouched",
+    );
+}
+
+// --- Phase 2: status logic + list queries ---------------------------------
+
+fn status_of(conn: &Connection, id: TaskId) -> Status {
+    store::get(conn, id).unwrap().unwrap().status
+}
+
+fn completed_at(conn: &Connection, id: TaskId) -> Option<chrono::DateTime<chrono::Utc>> {
+    store::get(conn, id).unwrap().unwrap().completed_at
+}
+
+#[test]
+fn completing_a_parent_cascades_one_shared_timestamp_to_open_descendants() {
+    let (_dir, mut conn) = fresh_db();
+
+    let root = store::create_task(&conn, "root", "").unwrap();
+    let mid = store::create_subtask(&conn, root, "mid", "").unwrap();
+    let leaf = store::create_subtask(&conn, mid, "leaf", "").unwrap();
+
+    // A descendant finished earlier keeps its own, earlier completion time.
+    let earlier = store::create_subtask(&conn, root, "earlier", "").unwrap();
+    store::set_status(&mut conn, earlier, Status::Done).unwrap();
+    let earlier_ts = completed_at(&conn, earlier).unwrap();
+
+    std::thread::sleep(Duration::from_millis(5));
+    store::set_status(&mut conn, root, Status::Done).unwrap();
+
+    assert_eq!(status_of(&conn, root), Status::Done);
+    assert_eq!(status_of(&conn, mid), Status::Done);
+    assert_eq!(status_of(&conn, leaf), Status::Done);
+
+    let root_ts = completed_at(&conn, root);
+    assert!(root_ts.is_some());
+    assert_eq!(
+        completed_at(&conn, mid),
+        root_ts,
+        "mid shares root's timestamp"
+    );
+    assert_eq!(
+        completed_at(&conn, leaf),
+        root_ts,
+        "leaf shares root's timestamp"
+    );
+
+    assert_eq!(
+        completed_at(&conn, earlier),
+        Some(earlier_ts),
+        "an already-completed descendant is not re-stamped",
+    );
+    assert_ne!(completed_at(&conn, earlier), root_ts);
+}
+
+#[test]
+fn abandoning_cascades_only_over_still_open_descendants() {
+    let (_dir, mut conn) = fresh_db();
+
+    let root = store::create_task(&conn, "root", "").unwrap();
+    let open_child = store::create_subtask(&conn, root, "open", "").unwrap();
+    let done_child = store::create_subtask(&conn, root, "done", "").unwrap();
+    store::set_status(&mut conn, done_child, Status::Done).unwrap();
+
+    store::set_status(&mut conn, root, Status::Abandoned).unwrap();
+
+    assert_eq!(status_of(&conn, root), Status::Abandoned);
+    assert_eq!(status_of(&conn, open_child), Status::Abandoned);
+    assert_eq!(
+        status_of(&conn, done_child),
+        Status::Done,
+        "a completed descendant keeps its own status",
+    );
+    assert_eq!(completed_at(&conn, open_child), completed_at(&conn, root));
+}
+
+#[test]
+fn reopening_clears_only_that_rows_completion_time() {
+    let (_dir, mut conn) = fresh_db();
+
+    let root = store::create_task(&conn, "root", "").unwrap();
+    let mid = store::create_subtask(&conn, root, "mid", "").unwrap();
+    let leaf = store::create_subtask(&conn, mid, "leaf", "").unwrap();
+
+    store::set_status(&mut conn, root, Status::Done).unwrap();
+    store::set_status(&mut conn, root, Status::InProgress).unwrap();
+
+    assert_eq!(status_of(&conn, root), Status::InProgress);
+    assert_eq!(completed_at(&conn, root), None);
+
+    // Descendants are deliberately left completed (no un-cascade).
+    assert_eq!(status_of(&conn, mid), Status::Done);
+    assert!(completed_at(&conn, mid).is_some());
+    assert_eq!(status_of(&conn, leaf), Status::Done);
+    assert!(completed_at(&conn, leaf).is_some());
+}
+
+#[test]
+fn set_status_rejects_an_unknown_task() {
+    let (_dir, mut conn) = fresh_db();
+
+    assert!(store::set_status(&mut conn, TaskId(123), Status::Done).is_err());
+}
+
+#[test]
+fn outstanding_ordered_groups_in_progress_then_on_hold_then_the_rest() {
+    let (_dir, mut conn) = fresh_db();
+
+    // Created in this order; creation order breaks ties within a group.
+    let parent = store::create_task(&conn, "parent", "").unwrap();
+    let sub = store::create_subtask(&conn, parent, "sub", "").unwrap();
+    let solo = store::create_task(&conn, "solo", "").unwrap();
+    let held = store::create_task(&conn, "held", "").unwrap();
+    let fresh = store::create_task(&conn, "fresh", "").unwrap();
+    let finished = store::create_task(&conn, "finished", "").unwrap();
+
+    store::set_status(&mut conn, sub, Status::InProgress).unwrap();
+    store::set_status(&mut conn, solo, Status::InProgress).unwrap();
+    store::set_status(&mut conn, held, Status::OnHold).unwrap();
+    store::set_status(&mut conn, finished, Status::Done).unwrap();
+
+    let rows = store::outstanding_ordered(&conn).unwrap();
+    let ids: Vec<TaskId> = rows.iter().map(|r| r.task.id).collect();
+
+    assert_eq!(
+        ids,
+        vec![sub, solo, held, parent, fresh],
+        "in_progress (oldest first), then on_hold, then the rest (oldest first)",
+    );
+
+    let sub_row = rows.iter().find(|r| r.task.id == sub).unwrap();
+    assert_eq!(sub_row.breadcrumb, vec!["parent".to_string()]);
+
+    let solo_row = rows.iter().find(|r| r.task.id == solo).unwrap();
+    assert!(
+        solo_row.breadcrumb.is_empty(),
+        "top-level rows have no breadcrumb"
+    );
+}
+
+#[test]
+fn completed_ordered_lists_newest_completion_first() {
+    let (_dir, mut conn) = fresh_db();
+
+    let a = store::create_task(&conn, "a", "").unwrap();
+    store::set_status(&mut conn, a, Status::Done).unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+
+    let b = store::create_task(&conn, "b", "").unwrap();
+    store::set_status(&mut conn, b, Status::Abandoned).unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+
+    // Newest: a parent completed via cascade, so parent and child share a time.
+    let root = store::create_task(&conn, "root", "").unwrap();
+    let kid = store::create_subtask(&conn, root, "kid", "").unwrap();
+    store::set_status(&mut conn, root, Status::Done).unwrap();
+
+    // An outstanding task must not appear.
+    let _open = store::create_task(&conn, "open", "").unwrap();
+
+    let ids: Vec<TaskId> = store::completed_ordered(&conn)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.task.id)
+        .collect();
+
+    assert_eq!(
+        ids,
+        vec![root, kid, b, a],
+        "id ascending breaks a shared timestamp"
     );
 }

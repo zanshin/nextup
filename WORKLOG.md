@@ -49,3 +49,29 @@
   loop); migrate-from-empty is covered by `opens_and_migrates_a_fresh_database`.
 - Verified: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test` (14 tests) all clean.
+
+## 2026-09-07 — Phase 2: Status logic + list queries
+
+- `model.rs`: `Status::is_outstanding` / `is_completed` predicates + a unit test
+  asserting they partition the six statuses exactly.
+- `store::set_status(&mut Connection, id, status)` (TDD, transactional):
+  - To a completed status: `completed_at = COALESCE(completed_at, now)` on the
+    row, then read the effective timestamp back and hand it to every
+    still-outstanding descendant (recursive `descendants` CTE + `WITH ... UPDATE`,
+    filtered to `status IN <outstanding>`). Already-completed descendants keep
+    their own status and timestamp.
+  - To an outstanding status: clear this row's `completed_at` only; no
+    un-cascade of descendants.
+  - Unknown id -> error (checked via rows-affected).
+- `store::outstanding_ordered` -> `Vec<TaskRow>`: `WHERE status IN <outstanding>`,
+  `ORDER BY CASE status ... END, created_at ASC, id ASC` (in_progress, then
+  on_hold, then the rest; oldest first per group).
+- `store::completed_ordered` -> `Vec<TaskRow>`: completed set, `ORDER BY
+  completed_at DESC, id ASC` (id ascending puts a cascaded parent before its
+  children when they share a timestamp).
+- New `TaskRow { task, breadcrumb }`; `with_breadcrumbs` attaches ancestor titles
+  (root first) via one `ancestors` query per row.
+- `OUTSTANDING_SQL` / `COMPLETED_SQL` status-tuple consts; kept in lock-step with
+  `model::Status` (guarded by the model round-trip/schema tests).
+- Verified: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (5 unit + 16 integration) all clean.
