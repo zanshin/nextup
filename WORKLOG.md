@@ -75,3 +75,46 @@
   `model::Status` (guarded by the model round-trip/schema tests).
 - Verified: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test` (5 unit + 16 integration) all clean.
+
+## 2026-09-07 — Phase 3: Daily planning logic
+
+- Migration 2: `planning_sessions` (`plan_date` unique) + `planning_items`
+  (composite PK `session_id, task_id`, `carried_over` flag), both FK
+  `ON DELETE CASCADE`. Registered in `migrations()`.
+- New `store` planning-table repository fns (all SQL stays in `store`):
+  `planning_session_on`, `latest_planning_session_before` (strict `<` so a
+  skipped weekend still carries from the last real session),
+  `create_planning_session`, `clear_planning_items`, `upsert_planning_item`
+  (`ON CONFLICT … DO UPDATE`), `planning_items` (priority order),
+  `set_task_priority`, and `task_row` (task + breadcrumb).
+- `store::set_status` refactored into a thin `&mut Connection` transactional
+  wrapper over `pub(crate) set_status_within(&Connection, …)` so planning's
+  swap can run it inside its own transaction. Phase 2 behaviour/tests
+  unchanged.
+- `planning.rs`:
+  - Pure helpers (unit-tested): `rank_carried_over` (sort by prior priority,
+    assign 4,5,6,…, `task_id` tie-break) and `next_auto_priority` (end of the
+    4+ range).
+  - `PlanError` (`thiserror`): `UnknownTask`, `NotOutstanding`,
+    `AlreadyInTopThree`, `BadSlot`, `NoPlan`, plus transparent `Storage`
+    wrapping `anyhow`/`rusqlite` errors.
+  - `candidates` — `outstanding_ordered` annotated with each task's
+    most-recent-prior-session priority.
+  - `commit_session(&mut Connection, NaiveDate, [Option<TaskId>; 3])` —
+    transactional: upsert/clear the session, slot-indexed picks (priority ==
+    slot), then carry over still-outstanding non-picked prior members at
+    4,5,6,…; writes `tasks.priority` for every session member and leaves
+    completed drop-outs' priority alone. Rejects a non-outstanding pick.
+  - `swap_pick(&mut Connection, NaiveDate, slot, TaskId)` — guards
+    (`BadSlot`, `NoPlan`, `NotOutstanding`, `AlreadyInTopThree`); benched
+    occupant → `on_hold`, `carried_over`, priority to end of 4+ range; new
+    task takes the slot.
+  - `plan_for` — load a committed `Plan` (or `None`).
+- Integration tests (`tests/planning.rs`, 15): day-1 picks + carry 4/5 by
+  prior priority; next-day re-rank with a completed task keeping its
+  priority; skipped-day carry; re-plan overwrite; swap benches to `on_hold`
+  at end of 4+ range; each guard error; 0-outstanding empty plan; picking an
+  `in_progress`/`on_hold` task; candidate annotation; mid-day completion
+  keeps history but leaves active views; `plan_for`.
+- No terminal code. Verified: `cargo fmt --check`, `cargo clippy
+  --all-targets -- -D warnings`, `cargo test` (9 unit + 31 integration) clean.

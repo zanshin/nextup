@@ -67,10 +67,15 @@ tests/
 
 ## Status
 
-Phase 2 complete. `model` has `Status`/`TaskId`/`Task` plus `is_outstanding` /
-`is_completed`. `store` has `open` + migration 1, task CRUD,
-`children`/`subtree`/`ancestors` CTEs, cascade delete, `set_status` (completion
-timestamp + cascade rules), and `outstanding_ordered` / `completed_ordered`
-returning `TaskRow { task, breadcrumb }`. Covered by 5 unit + 16 integration
-tests. `main.rs` does not open the store yet — that lands with the Phase 4 event
-loop. See WORKLOG.md and the plan for the phase breakdown.
+Phase 3 complete — all pure domain logic done, still no terminal code.
+
+- `model`: `Status`/`TaskId`/`Task`, `is_outstanding`/`is_completed`.
+- `store`: `open` + migrations 1 & 2, task CRUD, `children`/`subtree`/`ancestors`,
+  cascade delete, `set_status` (+ `pub(crate) set_status_within`),
+  `outstanding_ordered`/`completed_ordered`/`task_row` (`TaskRow`), and the
+  planning-table repository fns. All SQL lives here.
+- `planning`: `candidates`, `commit_session`, `swap_pick`, `plan_for`, `PlanError`;
+  pure `rank_carried_over` / `next_auto_priority`.
+
+Covered by 9 unit + 31 integration tests. `main.rs` still does not open the store
+— that lands with the Phase 4 event loop. See WORKLOG.md and the plan.
