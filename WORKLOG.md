@@ -224,3 +224,46 @@
   unit tests.
 - Verified: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test` (21 unit + 48 integration = 69) all clean.
+
+## 2026-09-07 — Phase 7: Polish + docs
+
+- `PendingAction` grew from a unit enum to carry data: `CommitPlan`,
+  `DeleteTask(TaskId)`, `ReopenTask { id, to }` (still `Copy`).
+- Delete: `d` on lists / Detail → `Confirm` overlay ("Delete \"…\"? Its
+  subtasks are deleted too.") → `store::delete` (FK cascade) → reload.
+  Deleting the task shown in Detail drops back to Outstanding (existing
+  `reload_detail` "task vanished" path).
+- Reopen: choosing an outstanding status for a completed task in the status
+  picker now routes through a `Confirm` overlay ("Reopen this task as …?
+  Completed subtasks stay done.") rather than applying immediately.
+- Footers trimmed and updated to mention `d delete` / the confirm keys.
+- Module doc comments refreshed (ui.rs overlay list).
+- `README.md`: install, data-file location per OS, `--db` / `NEXTUP_DB`,
+  the five screens, a full keybinding reference, the domain rules a user
+  should know (cascade, no un-cascade, carry-over, auto-rank), and the dev
+  commands.
+- `tests/tui.rs`: 3 e2e — delete asks then removes the subtree (decline +
+  confirm), delete-from-Detail returns to Outstanding, reopen is confirmed
+  and the task moves back to Outstanding.
+- Verified: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test` (21 unit + 51 integration = 72) all clean. `cargo build
+  --release` clean; binary creates + migrates the DB before touching the
+  terminal.
+
+### Manual QA checklist (real terminal)
+
+Run `rm -f /tmp/nextup-demo.db && cargo run --release -- --db /tmp/nextup-demo.db`:
+
+1. `n` create "Ship v1"; `a` twice to add "Docs" and "Tag". Open "Docs"
+   detail — confirm the `in: Ship v1` breadcrumb and the subtree view.
+2. On "Docs", `space` → `in_progress`; back to Outstanding — it jumps to the
+   top.
+3. `s` to plan; pick 3 with `1`/`2`/`3`; `Enter`. On Today confirm 1/2/3 and
+   that any previously prioritised open task is auto-assigned 4.
+4. `w` on slot 1; pick a replacement — confirm the old item is now `on_hold`
+   with a 4+ number.
+5. Select "Ship v1", `space` → `done`; open Completed — every subtask is
+   `done` with the same date.
+6. `d` on a task, confirm — it and its subtree vanish; `n` decline leaves it.
+7. `q`, relaunch — all state persisted. On macOS confirm the default DB is
+   under `~/Library/Application Support/nextup/` when run without `--db`.

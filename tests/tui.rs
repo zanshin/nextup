@@ -595,3 +595,73 @@ fn today_screen_shows_an_empty_state_and_supports_quick_status_changes() {
     assert!(row_with(&tui.screen(), "Task one").contains("done"));
     assert_eq!(task_by_title(&tui.conn, "Task one").status, Status::Done);
 }
+
+// --- Phase 7: destructive-action confirmations ------------------------------
+
+#[test]
+fn deleting_a_task_asks_first_and_then_removes_the_subtree() {
+    let mut tui = Tui::new(|conn| {
+        let parent = store::create_task(conn, "Parent", "").unwrap();
+        store::create_subtask(conn, parent, "Child", "").unwrap();
+        store::create_task(conn, "Bystander", "").unwrap();
+    });
+
+    // decline first
+    tui.press(KeyCode::Char('d'));
+    assert!(tui.screen().contains("Delete \"Parent\""));
+    tui.press(KeyCode::Char('n'));
+    assert!(tui.screen().contains("Parent"));
+
+    // confirm: parent and its child are gone, the bystander stays
+    tui.press(KeyCode::Char('d')).press(KeyCode::Char('y'));
+    let screen = tui.screen();
+    assert!(!screen.contains("Parent"));
+    assert!(!screen.contains("Child"));
+    assert!(screen.contains("Bystander"));
+}
+
+#[test]
+fn deleting_the_task_shown_in_detail_returns_to_outstanding() {
+    let mut tui = Tui::new(|conn| {
+        store::create_task(conn, "Doomed", "").unwrap();
+        store::create_task(conn, "Keeper", "").unwrap();
+    });
+
+    tui.press(KeyCode::Enter); // open "Doomed"
+    assert!(matches!(tui.app.screen, Screen::Detail(_)));
+
+    tui.press(KeyCode::Char('d')).press(KeyCode::Char('y'));
+    assert!(matches!(tui.app.screen, Screen::Outstanding));
+    let screen = tui.screen();
+    assert!(!screen.contains("Doomed"));
+    assert!(screen.contains("Keeper"));
+}
+
+#[test]
+fn reopening_a_completed_task_is_confirmed() {
+    let mut tui = Tui::new(|conn| {
+        let done = store::create_task(conn, "Finished", "").unwrap();
+        store::set_status(conn, done, Status::Done).unwrap();
+    });
+
+    tui.press(KeyCode::Char('c')); // Completed screen
+    assert!(row_with(&tui.screen(), "Finished").contains("done"));
+
+    // status picker -> pick "new" -> reopen confirmation
+    tui.press(KeyCode::Char(' '));
+    tui.press(KeyCode::Char('k'))
+        .press(KeyCode::Char('k'))
+        .press(KeyCode::Char('k'));
+    tui.press(KeyCode::Char('k')).press(KeyCode::Char('k')); // to index 0 (new)
+    tui.press(KeyCode::Enter);
+    assert!(tui.screen().contains("Reopen this task"));
+
+    tui.press(KeyCode::Char('y'));
+    assert_eq!(task_by_title(&tui.conn, "Finished").status, Status::New);
+
+    // it now shows on Outstanding, gone from Completed
+    tui.press(KeyCode::Char('o'));
+    assert!(tui.screen().contains("Finished"));
+    tui.press(KeyCode::Char('c'));
+    assert!(tui.screen().contains("Nothing completed yet."));
+}

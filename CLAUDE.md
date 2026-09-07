@@ -67,8 +67,9 @@ tests/
 
 ## Status
 
-Phase 6 complete — the daily planning workflow works end to end. All feature
-phases done; Phase 7 is polish + docs.
+Phase 7 complete — shippable v1. Delete (`d`, confirmed, cascades) and
+confirmed reopen added; `README.md` written; `WORKLOG.md` finalised with a
+manual-QA checklist. All phases done.
 
 - `model`: `Status`/`TaskId`/`Task`, `is_outstanding`/`is_completed`.
 - `store`: `open` + migrations 1 & 2, task CRUD, `children`/`subtree`/`ancestors`,
@@ -99,5 +100,5 @@ Planning: `1/2/3` assign selected candidate to a slot (repeat to unassign),
 `0`/`x` clear, `Enter` commit (confirms before overwriting an existing plan).
 Today: `space` status, `w` swap a top-3 slot (benched task → `on_hold` at 4+).
 
-Covered by 21 unit + 48 integration tests (incl. 17 `TestBackend` e2e). See
-WORKLOG.md.
+Covered by 21 unit + 51 integration tests (incl. 20 `TestBackend` e2e). See
+WORKLOG.md (including the manual-QA checklist).

@@ -96,6 +96,7 @@ fn list_action(code: KeyCode) -> Option<Action> {
         KeyCode::Char('E') => Some(Action::EditNotes),
         KeyCode::Char('r') => Some(Action::EditPriority),
         KeyCode::Char(' ') => Some(Action::ChangeStatus),
+        KeyCode::Char('d') => Some(Action::DeleteTask),
         _ => None,
     }
 }

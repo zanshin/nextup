@@ -59,6 +59,7 @@ pub enum Action {
     EditNotes,
     EditPriority,
     ChangeStatus,
+    DeleteTask,
 
     StartPlanning,
     ShowToday,
@@ -239,7 +240,13 @@ pub struct TaskPicker {
 /// A deferred action awaiting a yes/no confirmation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingAction {
+    /// Commit today's plan over an existing one.
     CommitPlan,
+    /// Delete a task and its subtree.
+    DeleteTask(TaskId),
+    /// Move a completed task back to an outstanding status (its already-completed
+    /// subtasks deliberately stay done).
+    ReopenTask { id: TaskId, to: Status },
 }
 
 /// A yes/no confirmation prompt guarding a destructive action.
@@ -403,6 +410,7 @@ impl App {
             Action::EditNotes => self.begin_edit_notes(conn)?,
             Action::EditPriority => self.begin_edit_priority(conn)?,
             Action::ChangeStatus => self.begin_change_status(conn)?,
+            Action::DeleteTask => self.begin_delete(conn)?,
 
             Action::StartPlanning => self.start_planning(conn)?,
             Action::ShowToday => self.show_today(conn)?,
@@ -469,8 +477,26 @@ impl App {
             Action::Cancel => self.overlay = None,
             Action::Confirm => match self.overlay.take() {
                 Some(Overlay::StatusPicker(picker)) => {
-                    store::set_status(conn, picker.target, Status::ALL[picker.selected])?;
-                    self.reload(conn)?;
+                    let target = picker.target;
+                    let chosen = Status::ALL[picker.selected];
+                    let currently_completed =
+                        store::get(conn, target)?.is_some_and(|task| task.status.is_completed());
+
+                    if currently_completed && chosen.is_outstanding() {
+                        // Reopening: confirm, since completed subtasks stay done.
+                        self.overlay = Some(Overlay::Confirm(Confirm {
+                            prompt: format!(
+                                "Reopen this task as {chosen}? Completed subtasks stay done."
+                            ),
+                            action: PendingAction::ReopenTask {
+                                id: target,
+                                to: chosen,
+                            },
+                        }));
+                    } else {
+                        store::set_status(conn, target, chosen)?;
+                        self.reload(conn)?;
+                    }
                 }
                 Some(Overlay::TaskPicker(picker)) => {
                     if let Some(chosen) = picker
@@ -505,6 +531,14 @@ impl App {
                 if let Some(Overlay::Confirm(confirm)) = self.overlay.take() {
                     match confirm.action {
                         PendingAction::CommitPlan => self.commit_plan(conn)?,
+                        PendingAction::DeleteTask(id) => {
+                            store::delete(conn, id)?;
+                            self.reload(conn)?;
+                        }
+                        PendingAction::ReopenTask { id, to } => {
+                            store::set_status(conn, id, to)?;
+                            self.reload(conn)?;
+                        }
                     }
                 }
             }
@@ -748,6 +782,17 @@ impl App {
             self.overlay = Some(Overlay::StatusPicker(StatusPicker {
                 target: task.id,
                 selected,
+            }));
+        }
+
+        Ok(())
+    }
+
+    fn begin_delete(&mut self, conn: &Connection) -> Result<()> {
+        if let Some(task) = self.target_task(conn)? {
+            self.overlay = Some(Overlay::Confirm(Confirm {
+                prompt: format!("Delete \"{}\"? Its subtasks are deleted too.", task.title),
+                action: PendingAction::DeleteTask(task.id),
             }));
         }
 

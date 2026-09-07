@@ -1,8 +1,8 @@
 //! Rendering. `render(&App, &mut Frame)` draws the active screen as a header
-//! line, a body, and a context-sensitive footer, then any open overlay (the
-//! line editor or the status picker) as a centred popup. This module only reads
-//! `App`. Selection is drawn with a literal `> ` marker so it shows in
-//! plain-text snapshots.
+//! line, a body, and a context-sensitive footer, then any open overlay (line
+//! editor, status picker, task picker, confirm prompt) as a centred popup. This
+//! module only reads `App`. Selection is drawn with a literal `> ` marker so it
+//! shows in plain-text snapshots.
 
 use chrono::{DateTime, Local, Utc};
 use ratatui::Frame;
@@ -72,13 +72,13 @@ fn footer_widget(app: &App) -> Paragraph<'_> {
         Some(_) => "j/k move · enter confirm · esc cancel",
         None => match app.screen {
             Screen::Outstanding | Screen::Completed => {
-                "j/k move · enter detail · n new · a subtask · e/E title/notes · r priority · space status · s plan · t today · q quit"
+                "j/k move · enter open · n/a new/subtask · e/E/r edit · space status · d delete · s plan · t today · q quit"
             }
             Screen::Detail(_) => {
-                "j/k move · enter open · p parent · tab fold · n/a new/subtask · e/E title/notes · r priority · space status · esc back"
+                "j/k move · enter open · p parent · tab fold · n/a new · e/E/r edit · space status · d delete · esc back"
             }
-            Screen::Planning => "j/k move · 1/2/3 assign · x clear · enter commit · esc cancel",
-            Screen::Today => "j/k move · space status · w swap slot · s re-plan · esc back",
+            Screen::Planning => "j/k move · 1/2/3 assign · 0/x clear · enter commit · esc cancel",
+            Screen::Today => "j/k move · space status · w swap · s re-plan · esc back",
         },
     };
 
